@@ -1,0 +1,164 @@
+/**
+ * Weather edge analysis runner.
+ *
+ * Usage:
+ *   npx tsx src/weather/analyze.ts [--city <id>] [--days N] [--bias B]
+ *
+ * Examples:
+ *   npx tsx src/weather/analyze.ts --city london --days 3
+ *   npx tsx src/weather/analyze.ts --city seoul --bias -0.5
+ */
+
+import { fetchEcmwfEnsemble, fetchKmaForecast, fetchMetOfficeEnsemble, EnsembleMember } from './ensemble';
+import { fetchMarketOdds } from './polymarket_odds';
+import { computeBracketProbabilities, computeEdgeTable, buildBrackets, bracketLabel, BracketProbabilities } from './brackets';
+import { fetchMonthlyAnomaly } from './gistemp';
+import { parseCityArg, CITIES } from './cities';
+
+// ---------------------------------------------------------------------------
+// CLI args
+// ---------------------------------------------------------------------------
+const args = process.argv.slice(2);
+let forecastDays  = 7;
+let biasCorrection = 0;
+
+for (let i = 0; i < args.length; i++) {
+  if (args[i] === '--days' && args[i + 1]) forecastDays   = parseInt(args[++i], 10);
+  if (args[i] === '--bias' && args[i + 1]) biasCorrection = parseFloat(args[++i]);
+}
+
+const city = parseCityArg(args);
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+async function main() {
+  const brackets = buildBrackets(city);
+
+  console.log(`\n=== Polymarket Weather Edge Analyzer — ${city.name} ===`);
+  console.log(`Resolution station: ${city.wundergroundUrl}`);
+  console.log(`Coordinates: ${city.lat}°N, ${city.lon}°E`);
+  console.log(`Bias correction: ${biasCorrection >= 0 ? '+' : ''}${biasCorrection}°C\n`);
+
+  // Seasonal anomaly
+  console.log('Fetching seasonal anomaly…');
+  let anomaly: { anomalyC: number; year: number; month: number } | null = null;
+  try {
+    anomaly = await fetchMonthlyAnomaly(city);
+    const sign = anomaly.anomalyC >= 0 ? '+' : '';
+    console.log(`  → ${anomaly.year}-${String(anomaly.month).padStart(2,'0')}: ${sign}${anomaly.anomalyC.toFixed(2)}°C vs 1991-2020 normal\n`);
+  } catch (e) {
+    console.warn(`  ⚠ ${(e as Error).message}\n`);
+  }
+
+  // ECMWF ensemble
+  console.log('Fetching ECMWF IFS ensemble (51 members)…');
+  let ecmwfMembers: EnsembleMember[] = [];
+  try {
+    ecmwfMembers = await fetchEcmwfEnsemble(city, forecastDays);
+    const dates = [...new Set(ecmwfMembers.map(m => m.date))];
+    console.log(`  → ${ecmwfMembers.length} member-days across ${dates.length} dates\n`);
+  } catch (e) {
+    console.error(`  ✗ ${(e as Error).message}`); process.exit(1);
+  }
+
+  // Secondary model: KMA for Seoul, Met Office for London
+  let secondaryMembers: EnsembleMember[] = [];
+  if (city.id === 'seoul') {
+    console.log('Fetching KMA LDPS (1.5km, 2-day)…');
+    try {
+      secondaryMembers = await fetchKmaForecast(city, 2);
+      for (const f of secondaryMembers) console.log(`  → ${f.date}: ${f.tempMaxC.toFixed(1)}°C`);
+      console.log('');
+    } catch (e) { console.warn(`  ⚠ ${(e as Error).message}\n`); }
+  } else if (city.id === 'london') {
+    console.log('Fetching UK Met Office ensemble…');
+    try {
+      secondaryMembers = await fetchMetOfficeEnsemble(city, forecastDays);
+      const dates = [...new Set(secondaryMembers.map(m => m.date))];
+      console.log(`  → ${secondaryMembers.length} member-days across ${dates.length} dates\n`);
+    } catch (e) { console.warn(`  ⚠ ${(e as Error).message}\n`); }
+  }
+
+  // Polymarket odds
+  console.log('Fetching Polymarket live odds…');
+  const dates = [...new Set(ecmwfMembers.map(m => m.date))].sort();
+  const oddsMap: Record<string, Partial<BracketProbabilities>> = {};
+  const volumeMap: Record<string, number> = {};
+
+  for (const date of dates) {
+    try {
+      const odds = await fetchMarketOdds(city, date);
+      if (odds) {
+        oddsMap[date]   = odds.probs;
+        volumeMap[date] = odds.volume;
+        console.log(`  → ${date}: $${Math.round(odds.volume).toLocaleString()} vol, $${Math.round(odds.liquidity).toLocaleString()} liq`);
+      } else {
+        console.log(`  → ${date}: no market found`);
+      }
+    } catch (e) { console.warn(`  ⚠ ${date}: ${(e as Error).message}`); }
+  }
+  console.log('');
+
+  // Per-date output
+  for (const date of dates) {
+    const members  = ecmwfMembers.filter(m => m.date === date);
+    const temps    = members.map(m => m.tempMaxC);
+    const secondary = secondaryMembers.filter(m => m.date === date);
+
+    const modelProbs  = computeBracketProbabilities(temps, city, biasCorrection);
+    const marketProbs = oddsMap[date] ?? {};
+    const edgeTable   = computeEdgeTable(modelProbs, marketProbs, city);
+
+    const eMean = mean(temps);
+    const eStd  = stdDev(temps);
+    const p10   = pct(temps, 10);
+    const p90   = pct(temps, 90);
+
+    console.log(`─────────────────────────────────────────────`);
+    console.log(`${date}  |  ${city.name}`);
+    console.log(`ECMWF: mean=${eMean.toFixed(1)}°C  std=±${eStd.toFixed(1)}°C  p10=${p10.toFixed(1)}  p90=${p90.toFixed(1)}`);
+
+    if (secondary.length === 1) {
+      console.log(`${city.id === 'seoul' ? 'KMA LDPS' : 'Met Office'}: ${secondary[0].tempMaxC.toFixed(1)}°C`);
+    } else if (secondary.length > 1) {
+      const sTemps = secondary.map(m => m.tempMaxC);
+      console.log(`Met Office ensemble: mean=${mean(sTemps).toFixed(1)}°C  std=±${stdDev(sTemps).toFixed(1)}°C  (${sTemps.length} members)`);
+    }
+
+    if (anomaly) {
+      const sign = anomaly.anomalyC >= 0 ? '+' : '';
+      console.log(`Seasonal anomaly: ${sign}${anomaly.anomalyC.toFixed(2)}°C`);
+    }
+    if (volumeMap[date]) console.log(`Market volume: $${Math.round(volumeMap[date]).toLocaleString()}`);
+    console.log('');
+
+    const hasMarket = Object.keys(marketProbs).length > 0;
+    console.log(`  Bracket    Model%  Market%    Edge`);
+    console.log(`  ─────────────────────────────────`);
+    for (const row of edgeTable.filter(r => r.modelProb > 0 || r.marketProb > 0)) {
+      const mp  = (row.modelProb * 100).toFixed(1).padStart(6);
+      const mkp = hasMarket && row.marketProb > 0 ? (row.marketProb * 100).toFixed(1).padStart(6) : '   n/a';
+      const ep  = hasMarket && row.marketProb > 0 ? `${row.edge >= 0 ? '+' : ''}${(row.edge * 100).toFixed(1)}%`.padStart(7) : '      —';
+      const flag = hasMarket && Math.abs(row.edge) >= 0.05 ? ' ◄' : '';
+      console.log(`  ${row.label.padEnd(10)} ${mp}%  ${mkp}%  ${ep}${flag}`);
+    }
+    console.log('');
+  }
+
+  console.log(`Available cities: ${Object.keys(CITIES).join(', ')}`);
+}
+
+function mean(v: number[]) { return v.length ? v.reduce((a,b) => a+b,0)/v.length : 0; }
+function stdDev(v: number[]) {
+  if (!v.length) return 0;
+  const m = mean(v);
+  return Math.sqrt(v.reduce((a,b) => a+(b-m)**2,0)/v.length);
+}
+function pct(v: number[], p: number) {
+  if (!v.length) return 0;
+  const s = [...v].sort((a,b) => a-b);
+  return s[Math.min(Math.floor(p/100*s.length), s.length-1)];
+}
+
+main().catch(e => { console.error(e); process.exit(1); });
