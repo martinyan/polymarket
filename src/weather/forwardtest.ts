@@ -308,8 +308,15 @@ async function runResolver(): Promise<number> {
   const entries = readLog();
   let resolved  = 0;
 
-  // Group unresolved entries by city+date for efficient API calls
-  const pending = entries.filter(e => !e.resolved && e.market_date < new Date().toISOString().slice(0, 10));
+  // Group unresolved entries by city+date for efficient API calls.
+  // An entry is eligible once the city's local day has fully ended (not just when UTC date rolls over).
+  const nowMs   = Date.now();
+  const pending = entries.filter(e => {
+    if (e.resolved) return false;
+    const city = Object.values(CITIES).find(c => c.name === e.city);
+    if (!city) return false;
+    return nowMs >= cityDayEndUtcMs(e.market_date, city.timezone);
+  });
   const keys    = [...new Set(pending.map(e => `${e.city}|${e.market_date}`))];
 
   for (const key of keys) {

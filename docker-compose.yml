@@ -26,21 +26,17 @@ services:
     container_name: polymarket-weather-updater
     restart: unless-stopped
     working_dir: /app
-    # Schedule:
-    #   Every 15 min: run forwardtest (log signals when trade window opens, resolve past trades)
-    #   Every 60 min: also regenerate the visual dashboard (weather_analysis.html)
+    # Schedule every 15 min:
+    #   1. forwardtest all  — log new signals, resolve closed-out picks, print report
+    #   2. visualize        — rebuild HTML dashboard so audit log always reflects latest CSV
     entrypoint: >
       sh -c "npm ci --silent &&
-             CYCLE=0;
              while true; do
-               echo \"[$(date -u '+%H:%M:%S UTC')] --- run cycle $$CYCLE ---\";
-               if [ $$(( $$CYCLE % 2 )) -eq 0 ]; then
-                 echo \"[$(date -u '+%H:%M:%S UTC')] Regenerating dashboard...\";
-                 node_modules/.bin/tsx src/weather/visualize.ts --city all --days 7 2>&1;
-               fi;
+               echo \"[$(date -u '+%H:%M:%S UTC')] --- forwardtest ---\";
                node_modules/.bin/tsx src/weather/forwardtest.ts all --city all 2>&1;
+               echo \"[$(date -u '+%H:%M:%S UTC')] --- rebuilding dashboard ---\";
+               node_modules/.bin/tsx src/weather/visualize.ts --city all --days 7 2>&1;
                echo \"[$(date -u '+%H:%M:%S UTC')] Done. Sleeping 15 min.\";
-               CYCLE=$$(( $$CYCLE + 1 ));
                sleep 900;
              done"
     volumes:
