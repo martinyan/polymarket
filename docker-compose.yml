@@ -19,24 +19,29 @@ services:
       - "9000:80"
     volumes:
       - ./data:/usr/share/nginx/html:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
 
   weather-updater:
     image: node:20-bookworm-slim
     container_name: polymarket-weather-updater
     restart: unless-stopped
     working_dir: /app
-    # Every hour:
-    #   1. Regenerate the visual dashboard (weather_analysis.html)
-    #   2. Log any new BUY signals to forward_test_log.csv
-    #   3. Resolve any past trades that have settled
+    # Schedule:
+    #   Every 15 min: run forwardtest (log signals when trade window opens, resolve past trades)
+    #   Every 60 min: also regenerate the visual dashboard (weather_analysis.html)
     entrypoint: >
       sh -c "npm ci --silent &&
+             CYCLE=0;
              while true; do
-               echo \"[$(date -u '+%H:%M:%S UTC')] --- hourly run ---\";
-               node_modules/.bin/tsx src/weather/visualize.ts --city all --days 7 2>&1;
+               echo \"[$(date -u '+%H:%M:%S UTC')] --- run cycle $$CYCLE ---\";
+               if [ $$(( $$CYCLE % 2 )) -eq 0 ]; then
+                 echo \"[$(date -u '+%H:%M:%S UTC')] Regenerating dashboard...\";
+                 node_modules/.bin/tsx src/weather/visualize.ts --city all --days 7 2>&1;
+               fi;
                node_modules/.bin/tsx src/weather/forwardtest.ts all --city all 2>&1;
-               echo \"[$(date -u '+%H:%M:%S UTC')] Done. Sleeping 60 min.\";
-               sleep 3600;
+               echo \"[$(date -u '+%H:%M:%S UTC')] Done. Sleeping 15 min.\";
+               CYCLE=$$(( $$CYCLE + 1 ));
+               sleep 900;
              done"
     volumes:
       - .:/app

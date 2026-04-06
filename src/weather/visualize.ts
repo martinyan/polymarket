@@ -12,6 +12,27 @@ import { computeBracketProbabilities, computeEdgeTable, buildBrackets, bracketLa
 import { fetchMonthlyAnomaly } from './gistemp';
 import { CITIES, CityConfig } from './cities';
 import { computeBetSignals, detectArbOpportunity, BetSignal, ArbSignal } from './ev';
+import { ENV as _ENV } from '../config';
+const IS_LIVE_NOTE = _ENV.PREVIEW_MODE ? '🟡 PREVIEW MODE — no real orders placed' : '🔴 LIVE MODE — real orders placed';
+
+// ---------------------------------------------------------------------------
+// 12-hour trade window helpers (mirrors forwardtest.ts logic)
+// ---------------------------------------------------------------------------
+const TZ_OFFSET_HOURS: Record<string, number> = {
+  'Asia/Seoul': 9, 'Asia/Tokyo': 9, 'Asia/Shanghai': 8,
+  'Asia/Jerusalem': 3, 'Europe/London': 1,
+};
+function cityDayEndUtcMs(date: string, tz: string): number {
+  const [y, m, d] = date.split('-').map(Number);
+  return Date.UTC(y, m - 1, d + 1, 0, 0, 0) - (TZ_OFFSET_HOURS[tz] ?? 0) * 3_600_000;
+}
+function tradeWindowStatus(date: string, tz: string): { open: boolean; opensAt: string; closesAt: string } {
+  const dayEndMs   = cityDayEndUtcMs(date, tz);
+  const openMs     = dayEndMs - 12 * 3_600_000;
+  const now        = Date.now();
+  const fmt = (ms: number) => new Date(ms).toISOString().slice(11, 16) + ' UTC';
+  return { open: now >= openMs && now < dayEndMs, opensAt: fmt(openMs), closesAt: fmt(dayEndMs) };
+}
 
 // ---------------------------------------------------------------------------
 // CLI args
@@ -198,6 +219,7 @@ a.stn:hover{text-decoration:underline}
 .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(650px,1fr));gap:18px}
 .card{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:18px}
 .card.has-arb{border-color:#f97316}
+.card.has-window{border-color:#4ade80}
 .card-hdr{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:12px}
 .card-date{font-size:.98rem;font-weight:700;color:#f8fafc}
 .vol{font-size:.75rem;color:#64748b}
@@ -250,6 +272,37 @@ function switchTab(id){
   document.getElementById('panel-'+id).classList.add('active');
 }
 ${chartInits}
+// ---------------------------------------------------------------------------
+// Live trade-window countdown (updates every second, no server round-trip)
+// ---------------------------------------------------------------------------
+function fmtDuration(ms){
+  if(ms<=0) return '0m';
+  const h=Math.floor(ms/3600000), m=Math.floor((ms%3600000)/60000), s=Math.floor((ms%60000)/1000);
+  if(h>0) return h+'h '+String(m).padStart(2,'0')+'m '+String(s).padStart(2,'0')+'s';
+  if(m>0) return m+'m '+String(s).padStart(2,'0')+'s';
+  return s+'s';
+}
+function updateWindows(){
+  const now=Date.now();
+  document.querySelectorAll('.win-badge').forEach(el=>{
+    const openMs=parseInt(el.dataset.open), closeMs=parseInt(el.dataset.close);
+    if(now>=closeMs){
+      el.style.background='#1e293b'; el.style.color='#475569'; el.style.fontWeight='';
+      el.textContent='market closed';
+      el.closest('.card')&&el.closest('.card').classList.remove('has-window');
+    } else if(now>=openMs){
+      el.style.background='#14532d'; el.style.color='#4ade80'; el.style.fontWeight='700';
+      el.textContent='WINDOW OPEN · closes in '+fmtDuration(closeMs-now);
+      el.closest('.card')&&el.closest('.card').classList.add('has-window');
+    } else {
+      el.style.background='#1e293b'; el.style.color='#64748b'; el.style.fontWeight='';
+      el.textContent='window opens in '+fmtDuration(openMs-now)+' ('+new Date(openMs).toISOString().slice(11,16)+' UTC)';
+      el.closest('.card')&&el.closest('.card').classList.remove('has-window');
+    }
+  });
+}
+updateWindows();
+setInterval(updateWindows, 1000);
 </script>
 </body></html>`;
 }
@@ -297,6 +350,11 @@ function buildCard(s: DateSnapshot, city: CityConfig): string {
   const edgeRows  = computeEdgeTable(s.modelProbs, s.marketProbs, city)
     .filter(r => r.modelProb > 0 || r.marketProb > 0);
   const volStr    = s.volume ? `$${Math.round(s.volume/1000)}K vol · $${Math.round(s.liquidity/1000)}K liq` : 'no market';
+  const win       = tradeWindowStatus(s.date, city.timezone);
+  const dayEndMs  = cityDayEndUtcMs(s.date, city.timezone);
+  const openMs    = dayEndMs - 12 * 3_600_000;
+  // Embed UTC epoch timestamps as data attrs — client JS updates every second
+  const winBadge  = `<span class="win-badge" data-open="${openMs}" data-close="${dayEndMs}" style="border-radius:5px;padding:2px 9px;font-size:.7rem">loading…</span>`;
 
   const secChip = s.secondaryMean !== null
     ? `<div class="chip">${s.secondaryLabel} <strong>${s.secondaryMean.toFixed(1)}°C${s.secondaryStd!==null?` ±${s.secondaryStd.toFixed(1)}`:''}</strong></div>`
@@ -327,21 +385,30 @@ function buildCard(s: DateSnapshot, city: CityConfig): string {
     </div>`;
   })();
 
+  // Identify the single best bracket to trade (highest Kelly among BUYs, above price floor)
+  const buySignals   = s.signals.filter(x => x.action === 'BUY');
+  const bestBracket  = buySignals.sort((a, b) => b.kellyFraction - a.kellyFraction)[0]?.bracket;
+
   // Combined edge + EV + Kelly table
   const tableRows = edgeRows.map(row => {
-    const sig     = s.signals.find(x => x.bracket === row.bracket);
-    const mktPct  = row.marketProb > 0 ? (row.marketProb*100).toFixed(1)+'%' : '<span class="neu">—</span>';
-    const edgePct = row.marketProb > 0 ? `<span class="${row.edge>0.02?'pos':row.edge<-0.02?'neg':'neu'}">${row.edge>=0?'+':''}${(row.edge*100).toFixed(1)}%</span>` : '<span class="neu">—</span>';
-    const ev      = sig?.marketPrice > 0 ? `<span class="${sig.evPerDollar>=0?'pos':'neg'}">${sig.evPerDollar>=0?'+':''}${(sig.evPerDollar*100).toFixed(1)}¢</span>` : '<span class="neu">—</span>';
-    const kelly   = sig && sig.kellyFraction > 0 ? `${(sig.kellyFraction*100).toFixed(1)}%` : '<span class="neu">—</span>';
-    const sizing  = sig?.action === 'BUY' ? `$${sig.suggestedUsd.toFixed(0)}` : '<span class="neu">—</span>';
-    const action  = s.arb
+    const sig      = s.signals.find(x => x.bracket === row.bracket);
+    const isBest   = !s.arb && row.bracket === bestBracket;
+    const mktPct   = row.marketProb > 0 ? (row.marketProb*100).toFixed(1)+'%' : '<span class="neu">—</span>';
+    const edgePct  = row.marketProb > 0 ? `<span class="${row.edge>0.02?'pos':row.edge<-0.02?'neg':'neu'}">${row.edge>=0?'+':''}${(row.edge*100).toFixed(1)}%</span>` : '<span class="neu">—</span>';
+    const ev       = sig?.marketPrice > 0 ? `<span class="${sig.evPerDollar>=0?'pos':'neg'}">${sig.evPerDollar>=0?'+':''}${(sig.evPerDollar*100).toFixed(1)}¢</span>` : '<span class="neu">—</span>';
+    const kelly    = sig && sig.kellyFraction > 0 ? `${(sig.kellyFraction*100).toFixed(1)}%` : '<span class="neu">—</span>';
+    const sizing   = sig?.action === 'BUY' ? `$${sig.suggestedUsd.toFixed(0)}` : '<span class="neu">—</span>';
+    const action   = s.arb
       ? `<span class="b-arb">ARB</span>`
-      : sig?.action === 'BUY'
-        ? `<span class="b-buy">BUY</span>`
-        : `<span class="b-skip">${sig?.reason ?? ''}</span>`;
+      : isBest
+        ? `<span class="b-buy">BUY ★</span>`
+        : sig?.action === 'BUY'
+          ? `<span class="b-skip" title="Skipped: correlated with best bracket">SKIP (corr.)</span>`
+          : `<span class="b-skip">${sig?.reason ?? ''}</span>`;
 
-    return `<tr>
+    const rowStyle = isBest ? ' style="background:rgba(74,222,128,.06);outline:1px solid rgba(74,222,128,.2)"' : '';
+
+    return `<tr${rowStyle}>
       <td>${row.label}</td>
       <td>${(row.modelProb*100).toFixed(1)}%</td>
       <td>${mktPct}</td>
@@ -353,9 +420,12 @@ function buildCard(s: DateSnapshot, city: CityConfig): string {
     </tr>`;
   }).join('');
 
-  return `<div class="card${s.arb?' has-arb':''}">
+  return `<div class="card${s.arb?' has-arb':''}${win.open?' has-window':''}">
   <div class="card-hdr">
-    <div class="card-date">${s.date}</div>
+    <div>
+      <div class="card-date">${s.date}</div>
+      <div style="margin-top:4px">${winBadge}</div>
+    </div>
     <span class="vol">${volStr}</span>
   </div>
   ${arbHtml}
@@ -377,6 +447,7 @@ function buildCard(s: DateSnapshot, city: CityConfig): string {
     <thead><tr><th>Bracket</th><th>Model</th><th>Market</th><th>Edge</th><th>EV/¢$</th><th>Kelly</th><th>Size</th><th>Action</th></tr></thead>
     <tbody>${tableRows}</tbody>
   </table>
+  ${buySignals.length > 1 ? `<div style="font-size:.71rem;color:#64748b;margin-top:7px">★ = best bracket logged. Other qualifying brackets skipped — all share the same temperature draw (correlated risk). Min market price: 5¢.</div>` : ''}
 </div>`;
 }
 
@@ -434,13 +505,15 @@ function buildAuditPanel(): string {
   const raw   = readFileSync(CSV_PATH, 'utf8').trim().split('\n');
   if (raw.length <= 1) return `<div style="padding:24px;color:#64748b">No signals logged yet.</div>`;
 
-  // Parse rows
+  // Parse rows — support both 15-col (old) and 17-col (new, with order_status+order_id)
   type Row = { logged_at:string; city:string; market_date:string; bracket_label:string;
                model_prob:number; market_price:number; edge:number; ev_per_dollar:number;
-               kelly_pct:number; suggested_usd:number; resolved:boolean;
-               actual_bracket:string; pnl:number; notes:string };
+               kelly_pct:number; suggested_usd:number; order_status:string; order_id:string;
+               resolved:boolean; actual_bracket:string; pnl:number; notes:string };
   const rows: Row[] = raw.slice(1).map(line => {
     const c = line.split(',');
+    const hasOrderCols = c.length >= 17;
+    const base = hasOrderCols ? 2 : 0;
     return {
       logged_at:      c[0]  ?? '',
       city:           c[1]  ?? '',
@@ -452,10 +525,12 @@ function buildAuditPanel(): string {
       ev_per_dollar:  parseFloat(c[8]  ?? '0'),
       kelly_pct:      parseFloat(c[9]  ?? '0'),
       suggested_usd:  parseFloat(c[10] ?? '0'),
-      resolved:       c[11] === 'true',
-      actual_bracket: c[12] ?? '',
-      pnl:            parseFloat(c[13] ?? '0'),
-      notes:          (c[14] ?? '').replace(/^"|"$/g, ''),
+      order_status:   hasOrderCols ? (c[11] ?? 'preview') : 'preview',
+      order_id:       hasOrderCols ? (c[12] ?? '')         : '',
+      resolved:       c[11 + base] === 'true',
+      actual_bracket: c[12 + base] ?? '',
+      pnl:            parseFloat(c[13 + base] ?? '0'),
+      notes:          (c[14 + base] ?? '').replace(/^"|"$/g, ''),
     };
   });
 
@@ -465,19 +540,37 @@ function buildAuditPanel(): string {
   const totalPnl = closed.reduce((s, r) => s + r.pnl, 0);
   const totalRisked = closed.reduce((s, r) => s + r.suggested_usd, 0);
 
+  const livePlaced = rows.filter(r => r.order_status === 'placed').length;
+  const previewCount = rows.filter(r => r.order_status === 'preview').length;
+  const failedCount = rows.filter(r => r.order_status.startsWith('failed')).length;
+  const orderMode = livePlaced > 0 ? '🔴 LIVE' : '🟡 PREVIEW';
+
   const statCards = `
   <div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:22px">
-    ${statCard('Signals logged', String(rows.length))}
+    ${statCard('Signals', String(rows.length))}
+    ${statCard('Order mode', orderMode, livePlaced > 0 ? '#f87171' : '#fbbf24')}
+    ${statCard('Orders placed', String(livePlaced), livePlaced > 0 ? '#4ade80' : '#64748b')}
+    ${statCard('Preview / Failed', `${previewCount} / ${failedCount}`, '#64748b')}
     ${statCard('Open', String(open.length), '#93c5fd')}
-    ${statCard('Closed', String(closed.length), '#94a3b8')}
     ${statCard('Win rate', closed.length ? (wins.length/closed.length*100).toFixed(1)+'%' : '—', wins.length > 0 ? '#4ade80' : '#94a3b8')}
-    ${statCard('Total risked', '$'+totalRisked.toFixed(2), '#94a3b8')}
     ${statCard('Total P&L', (totalPnl>=0?'+':'')+'$'+totalPnl.toFixed(2), totalPnl>=0?'#4ade80':'#f87171')}
     ${statCard('ROI', totalRisked>0?(totalPnl/totalRisked*100).toFixed(1)+'%':'—', totalPnl>=0?'#4ade80':'#f87171')}
   </div>`;
 
   const tableRows = [...rows].sort((a,b)=>b.logged_at.localeCompare(a.logged_at)).map(r => {
-    const statusBadge = !r.resolved
+    const orderBadge = r.order_status === 'placed'
+      ? `<span style="background:#14532d;color:#4ade80;border-radius:4px;padding:1px 6px;font-size:.65rem;font-weight:700">PLACED</span>`
+      : r.order_status === 'preview'
+        ? `<span style="background:#422006;color:#fbbf24;border-radius:4px;padding:1px 6px;font-size:.65rem">PREVIEW</span>`
+        : r.order_status.startsWith('failed')
+          ? `<span style="background:#450a0a;color:#f87171;border-radius:4px;padding:1px 6px;font-size:.65rem" title="${r.order_status}">FAILED</span>`
+          : `<span style="color:#475569;font-size:.65rem">${r.order_status}</span>`;
+
+    const orderIdStr = r.order_id
+      ? `<span style="font-size:.65rem;color:#64748b;font-family:monospace" title="${r.order_id}">${r.order_id.slice(0,10)}…</span>`
+      : '';
+
+    const outcomeBadge = !r.resolved
       ? `<span style="background:#1e3a5f;color:#93c5fd;border-radius:4px;padding:1px 7px;font-size:.68rem;font-weight:700">OPEN</span>`
       : r.pnl > 0
         ? `<span style="background:#14532d;color:#4ade80;border-radius:4px;padding:1px 7px;font-size:.68rem;font-weight:700">WIN</span>`
@@ -500,16 +593,17 @@ function buildAuditPanel(): string {
       <td><span class="${r.ev_per_dollar>=0?'pos':'neg'}">${r.ev_per_dollar>=0?'+':''}${(r.ev_per_dollar*100).toFixed(1)}¢</span></td>
       <td>${(r.kelly_pct*100).toFixed(1)}%</td>
       <td>$${r.suggested_usd.toFixed(0)}</td>
+      <td>${orderBadge} ${orderIdStr}</td>
       <td>${actual}</td>
       <td>${pnlStr}</td>
-      <td>${statusBadge}</td>
+      <td>${outcomeBadge}</td>
     </tr>`;
   }).join('');
 
   return `
   <div style="margin-bottom:18px">
     <div class="city-title" style="margin-bottom:6px">Forward Test Audit Log</div>
-    <div class="city-meta">All BUY signals logged since ${rows[0]?.logged_at.slice(0,10) ?? '—'} · auto-updated hourly</div>
+    <div class="city-meta">All BUY signals since ${rows[0]?.logged_at.slice(0,10) ?? '—'} · updated every 15 min · ${IS_LIVE_NOTE}</div>
   </div>
   ${statCards}
   <div style="overflow-x:auto">
@@ -517,7 +611,7 @@ function buildAuditPanel(): string {
     <thead><tr>
       <th>Logged</th><th>City</th><th>Date</th><th>Bracket</th>
       <th>Model%</th><th>Mkt%</th><th>Edge</th><th>EV/¢$</th>
-      <th>Kelly</th><th>Size</th><th>Actual</th><th>P&amp;L</th><th>Status</th>
+      <th>Kelly</th><th>Size</th><th>Order</th><th>Actual</th><th>P&amp;L</th><th>Outcome</th>
     </tr></thead>
     <tbody>${tableRows}</tbody>
   </table>

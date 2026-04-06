@@ -14,8 +14,11 @@
  */
 
 import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { Side } from '@polymarket/clob-client';
+import { ENV } from '../config';
+import { createTradingClient } from '../polymarket';
 import { fetchEcmwfEnsemble, fetchSecondaryForecast, EnsembleMember } from './ensemble';
-import { fetchMarketOdds } from './polymarket_odds';
+import { fetchMarketOdds, BracketMarket } from './polymarket_odds';
 import { computeBracketProbabilities, buildBrackets, bracketLabel } from './brackets';
 import { computeBetSignals, BetSignal } from './ev';
 import { CITIES, CityConfig, parseCityArg } from './cities';
@@ -36,6 +39,9 @@ export type LogEntry = {
   ev_per_dollar:   number;   // Q/P - 1
   kelly_pct:       number;   // full Kelly fraction
   suggested_usd:   number;   // quarter-Kelly capped size
+  // Order execution:
+  order_status:    string;   // 'placed' | 'preview' | 'failed' | 'skipped'
+  order_id:        string;   // CLOB order ID if placed, empty otherwise
   // Filled in by resolver:
   resolved:        boolean;
   actual_bracket:  string;   // bracket that resolved YES
@@ -46,11 +52,47 @@ export type LogEntry = {
 const CSV_PATH    = 'data/forward_test_log.csv';
 const GAMMA_BASE  = 'https://gamma-api.polymarket.com';
 
+// How many hours before a day ends (in local city time) we are allowed to enter a bet.
+const TRADE_WINDOW_HOURS = 12;
+
+// UTC offsets (hours) for each city timezone, accurate for April (DST already applied).
+// Seoul/Tokyo/Shanghai have no DST. London = BST (UTC+1). Tel Aviv = IDT (UTC+3).
+const TZ_OFFSET_HOURS: Record<string, number> = {
+  'Asia/Seoul':     9,
+  'Asia/Tokyo':     9,
+  'Asia/Shanghai':  8,
+  'Asia/Jerusalem': 3,   // Israel Daylight Time, April
+  'Europe/London':  1,   // British Summer Time, April
+};
+
+/**
+ * Returns the UTC millisecond timestamp when `marketDate` ends (local midnight)
+ * in the city's timezone — i.e. when the daily high is fully determined.
+ *
+ * Example: Seoul Apr 6  → midnight Apr 7 KST = Apr 6 15:00 UTC
+ *          London Apr 6 → midnight Apr 7 BST = Apr 6 23:00 UTC
+ */
+function cityDayEndUtcMs(marketDate: string, timezone: string): number {
+  const [y, m, d]  = marketDate.split('-').map(Number);
+  const offsetHours = TZ_OFFSET_HOURS[timezone] ?? 0;
+  // Midnight start of next day in local time = UTC midnight of next day minus offset
+  return Date.UTC(y, m - 1, d + 1, 0, 0, 0) - offsetHours * 3_600_000;
+}
+
+/** Return ISO string showing when the 12h trade window opens for a city+date. */
+function windowOpenStr(marketDate: string, timezone: string): string {
+  const openMs = cityDayEndUtcMs(marketDate, timezone) - TRADE_WINDOW_HOURS * 3_600_000;
+  return new Date(openMs).toISOString();
+}
+
 const CSV_HEADERS: (keyof LogEntry)[] = [
   'logged_at', 'city', 'market_date', 'bracket', 'bracket_label',
   'model_prob', 'market_price', 'edge', 'ev_per_dollar', 'kelly_pct',
-  'suggested_usd', 'resolved', 'actual_bracket', 'pnl', 'notes',
+  'suggested_usd', 'order_status', 'order_id',
+  'resolved', 'actual_bracket', 'pnl', 'notes',
 ];
+
+const IS_LIVE = !ENV.PREVIEW_MODE && !!ENV.PRIVATE_KEY;
 
 // ---------------------------------------------------------------------------
 // CSV I/O
@@ -61,6 +103,9 @@ function readLog(): LogEntry[] {
   if (lines.length <= 1) return [];
   return lines.slice(1).map(line => {
     const cols = line.split(',');
+    // Support both old (15-col) and new (17-col) formats
+    const hasOrderCols = cols.length >= 17;
+    const base = hasOrderCols ? 2 : 0;  // shift for order_status + order_id cols
     return {
       logged_at:      cols[0]  ?? '',
       city:           cols[1]  ?? '',
@@ -73,10 +118,12 @@ function readLog(): LogEntry[] {
       ev_per_dollar:  parseFloat(cols[8]  ?? '0'),
       kelly_pct:      parseFloat(cols[9]  ?? '0'),
       suggested_usd:  parseFloat(cols[10] ?? '0'),
-      resolved:       cols[11] === 'true',
-      actual_bracket: cols[12] ?? '',
-      pnl:            parseFloat(cols[13] ?? '0'),
-      notes:          (cols[14] ?? '').replace(/^"|"$/g, ''),
+      order_status:   hasOrderCols ? (cols[11] ?? 'preview') : 'preview',
+      order_id:       hasOrderCols ? (cols[12] ?? '')         : '',
+      resolved:       cols[11 + base] === 'true',
+      actual_bracket: cols[12 + base] ?? '',
+      pnl:            parseFloat(cols[13 + base] ?? '0'),
+      notes:          (cols[14 + base] ?? '').replace(/^"|"$/g, ''),
     };
   });
 }
@@ -93,15 +140,57 @@ function writeLog(entries: LogEntry[]): void {
   writeFileSync(CSV_PATH, [header, ...rows].join('\n') + '\n', 'utf8');
 }
 
-function isDuplicate(entries: LogEntry[], city: string, date: string, bracket: string): boolean {
-  // Same city+date+bracket already logged today (within same calendar day UTC)
-  const today = new Date().toISOString().slice(0, 10);
+function isDuplicate(entries: LogEntry[], city: string, date: string): boolean {
+  // One position per city+date. Once logged (unresolved), skip all brackets for that event.
+  // Prevents both same-bracket re-logging and adding correlated brackets on later runs.
+  // Resolved entries are excluded — they no longer occupy the slot.
   return entries.some(e =>
     e.city === city &&
     e.market_date === date &&
-    e.bracket === bracket &&
-    e.logged_at.slice(0, 10) === today
+    !e.resolved
   );
+}
+
+// ---------------------------------------------------------------------------
+// Order execution — places a single BUY limit order on Polymarket CLOB
+// Returns { status, orderId }
+// ---------------------------------------------------------------------------
+async function placeOrder(
+  sig: BetSignal,
+  bm: BracketMarket,
+  city: CityConfig,
+  date: string,
+): Promise<{ status: string; orderId: string }> {
+  if (!IS_LIVE) {
+    console.log(`    [PREVIEW] would BUY ${sig.label} ${city.name} ${date} @ ${(sig.marketPrice*100).toFixed(1)}¢  $${sig.suggestedUsd.toFixed(0)}`);
+    return { status: 'preview', orderId: '' };
+  }
+
+  if (!bm.acceptingOrders) {
+    console.log(`    [SKIP] ${sig.label} ${city.name} ${date} — market not accepting orders`);
+    return { status: 'skipped-not-accepting', orderId: '' };
+  }
+
+  try {
+    const client = await createTradingClient();
+    const shares = sig.suggestedUsd / sig.marketPrice;
+    const resp: any = await client.createAndPostOrder(
+      {
+        tokenID: bm.yesTokenId,
+        price:   parseFloat(sig.marketPrice.toFixed(3)),
+        size:    parseFloat(shares.toFixed(2)),
+        side:    Side.BUY,
+      },
+      { tickSize: bm.tickSize as any, negRisk: bm.negRisk }
+    );
+    const orderId = resp?.orderID ?? resp?.id ?? JSON.stringify(resp).slice(0, 40);
+    console.log(`    [LIVE] ORDER PLACED ${sig.label} ${city.name} ${date}  id=${orderId}`);
+    return { status: 'placed', orderId };
+  } catch (err) {
+    const msg = (err as Error).message.slice(0, 80);
+    console.error(`    [FAILED] ${sig.label} ${city.name} ${date}  error=${msg}`);
+    return { status: `failed: ${msg}`, orderId: '' };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -137,14 +226,21 @@ async function runLogger(cityIds: string[]): Promise<number> {
     process.stdout.write('\n');
 
     const dates: string[] = [...new Set(members.map(m => m.date))].sort();
-
-    // Only trade within 24h of event close: today's market or tomorrow's market
-    const today    = new Date().toISOString().slice(0, 10);
-    const tomorrow = new Date(Date.now() + 86_400_000).toISOString().slice(0, 10);
+    const nowMs = Date.now();
 
     for (const date of dates) {
-      // Skip dates already passed or further than 24h away
-      if (date < today || date > tomorrow) continue;
+      const dayEndMs      = cityDayEndUtcMs(date, city.timezone);
+      const windowStartMs = dayEndMs - TRADE_WINDOW_HOURS * 3_600_000;
+
+      if (nowMs < windowStartMs) {
+        // Too early — window not open yet; log when it opens
+        process.stdout.write(`  [${city.name}] ${date} window opens ${windowOpenStr(date, city.timezone)} (in ${((windowStartMs - nowMs) / 3_600_000).toFixed(1)}h)\n`);
+        continue;
+      }
+      if (nowMs >= dayEndMs) {
+        // Day already over in this city's timezone — market closed
+        continue;
+      }
 
       const temps      = members.filter(m => m.date === date).map(m => m.tempMaxC);
       const modelProbs = computeBracketProbabilities(temps, city, 0);
@@ -153,33 +249,51 @@ async function runLogger(cityIds: string[]): Promise<number> {
       try { odds = await fetchMarketOdds(city, date); } catch { continue; }
       if (!odds || Object.keys(odds.probs).length === 0) continue;
 
-      const signals = computeBetSignals(modelProbs, odds.probs, city, 1000);
+      const signals    = computeBetSignals(modelProbs, odds.probs, city, 1000);
       const buySignals = signals.filter(s => s.action === 'BUY');
 
-      for (const sig of buySignals) {
-        if (isDuplicate(entries, city.name, date, String(sig.bracket))) continue;
+      // --- Correlated-bet guard ---
+      // All brackets on the same city+date share the same temperature draw.
+      // Portfolio Kelly collapses to: bet only the single highest-conviction bracket.
+      // Betting multiple brackets on the same event re-exposes to the same risk multiple times.
+      const totalAboveThreshold = buySignals.length;
+      const best = buySignals.sort((a, b) => b.kellyFraction - a.kellyFraction)[0];
+      if (!best) continue;
 
-        entries.push({
-          logged_at:      new Date().toISOString(),
-          city:           city.name,
-          market_date:    date,
-          bracket:        String(sig.bracket),
-          bracket_label:  sig.label,
-          model_prob:     sig.modelProb,
-          market_price:   sig.marketPrice,
-          edge:           sig.edge,
-          ev_per_dollar:  sig.evPerDollar,
-          kelly_pct:      sig.kellyFraction,
-          suggested_usd:  sig.suggestedUsd,
-          resolved:       false,
-          actual_bracket: '',
-          pnl:            0,
-          notes:          '',
-        });
+      if (isDuplicate(entries, city.name, date)) continue;
 
-        console.log(`    + ${city.name} ${date} ${sig.label}  edge=${(sig.edge*100).toFixed(1)}%  EV=${(sig.evPerDollar*100).toFixed(1)}¢  size=$${sig.suggestedUsd.toFixed(0)}`);
-        added++;
-      }
+      const note = totalAboveThreshold > 1
+        ? `best of ${totalAboveThreshold} qualifying brackets (highest Kelly)`
+        : '';
+
+      // Place the order (live or preview)
+      const bm = odds.bracketMarkets.find(b => b.bracket === best.bracket);
+      const { status: orderStatus, orderId } = bm
+        ? await placeOrder(best, bm, city, date)
+        : { status: 'skipped-no-token', orderId: '' };
+
+      entries.push({
+        logged_at:      new Date().toISOString(),
+        city:           city.name,
+        market_date:    date,
+        bracket:        String(best.bracket),
+        bracket_label:  best.label,
+        model_prob:     best.modelProb,
+        market_price:   best.marketPrice,
+        edge:           best.edge,
+        ev_per_dollar:  best.evPerDollar,
+        kelly_pct:      best.kellyFraction,
+        suggested_usd:  best.suggestedUsd,
+        order_status:   orderStatus,
+        order_id:       orderId,
+        resolved:       false,
+        actual_bracket: '',
+        pnl:            0,
+        notes:          note,
+      });
+
+      console.log(`    + ${city.name} ${date} ${best.label}  edge=${(best.edge*100).toFixed(1)}%  EV=${(best.evPerDollar*100).toFixed(1)}¢  size=$${best.suggestedUsd.toFixed(0)}  [${orderStatus}]${totalAboveThreshold > 1 ? `  (best of ${totalAboveThreshold})` : ''}`);
+      added++;
     }
   }
 

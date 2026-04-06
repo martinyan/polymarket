@@ -30,6 +30,7 @@ export const MIN_KELLY         = 0.03;  // skip bets with < 3% Kelly fraction
 export const MIN_EV_PER_DOLLAR = 0.04;  // skip bets with < 4¢ EV per dollar
 export const MAX_POSITION_USD  = 100;   // hard cap per bracket per day
 export const MIN_POSITION_USD  = 5;     // Polymarket minimum order size
+export const MIN_MARKET_PRICE  = 0.05;  // skip brackets priced below 5¢ — stale/illiquid
 
 export type BetSignal = {
   bracket: Bracket;
@@ -82,6 +83,18 @@ export function computeBetSignals(
         edge: Q - P, evPerDollar: 0, kellyFraction: 0,
         scaledKelly: 0, suggestedUsd: 0,
         action: 'SKIP', reason: P <= 0 ? 'no market price' : 'price at ceiling',
+      });
+      continue;
+    }
+
+    if (P < MIN_MARKET_PRICE) {
+      // Price below liquidity floor — edge is noise from stale/untraded sub-market
+      signals.push({
+        bracket, label: bracketLabel(bracket, city),
+        modelProb: Q, marketPrice: P,
+        edge: Q - P, evPerDollar: Q / P - 1, kellyFraction: 0,
+        scaledKelly: 0, suggestedUsd: 0,
+        action: 'SKIP', reason: `price ${(P*100).toFixed(1)}¢ < min ${(MIN_MARKET_PRICE*100).toFixed(0)}¢ liquidity floor`,
       });
       continue;
     }
