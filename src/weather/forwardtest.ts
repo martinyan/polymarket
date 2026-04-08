@@ -18,9 +18,9 @@ import { Side } from '@polymarket/clob-client';
 import { ENV } from '../config';
 import { createTradingClient } from '../polymarket';
 import { fetchEcmwfEnsemble, fetchSecondaryForecast, EnsembleMember } from './ensemble';
-import { fetchMarketOdds, BracketMarket } from './polymarket_odds';
-import { computeBracketProbabilities, buildBrackets, bracketLabel } from './brackets';
-import { computeBetSignals, BetSignal } from './ev';
+import { fetchMarketOdds, cityWithMarketBrackets, BracketMarket } from './polymarket_odds';
+import { computeBracketProbabilities, titleToBracket } from './brackets';
+import { applySingleMarketKellyRecommendation, computeBetSignals, BetSignal } from './ev';
 import { CITIES, CityConfig, parseCityArg } from './cities';
 import { fetchJson } from '../http';
 
@@ -51,9 +51,10 @@ export type LogEntry = {
 
 const CSV_PATH    = 'data/forward_test_log.csv';
 const GAMMA_BASE  = 'https://gamma-api.polymarket.com';
+const STARTING_BANKROLL_USD = 1000;
 
 // How many hours before a day ends (in local city time) we are allowed to enter a bet.
-const TRADE_WINDOW_HOURS = 12;
+const TRADE_WINDOW_HOURS = 8;
 
 // UTC offsets (hours) for each city timezone, accurate for April (DST already applied).
 // Seoul/Tokyo/Shanghai have no DST. London = BST (UTC+1). Tel Aviv = IDT (UTC+3).
@@ -79,7 +80,7 @@ function cityDayEndUtcMs(marketDate: string, timezone: string): number {
   return Date.UTC(y, m - 1, d + 1, 0, 0, 0) - offsetHours * 3_600_000;
 }
 
-/** Return ISO string showing when the 12h trade window opens for a city+date. */
+/** Return ISO string showing when the trade window opens for a city+date. */
 function windowOpenStr(marketDate: string, timezone: string): string {
   const openMs = cityDayEndUtcMs(marketDate, timezone) - TRADE_WINDOW_HOURS * 3_600_000;
   return new Date(openMs).toISOString();
@@ -149,6 +150,16 @@ function isDuplicate(entries: LogEntry[], city: string, date: string): boolean {
     e.market_date === date &&
     !e.resolved
   );
+}
+
+function currentForwardTestBankroll(entries: LogEntry[]): number {
+  const closedPnl = entries
+    .filter(e => e.resolved)
+    .reduce((sum, e) => sum + e.pnl, 0);
+  const openRisk = entries
+    .filter(e => !e.resolved)
+    .reduce((sum, e) => sum + e.suggested_usd, 0);
+  return Math.max(0, STARTING_BANKROLL_USD + closedPnl - openRisk);
 }
 
 // ---------------------------------------------------------------------------
@@ -242,25 +253,56 @@ async function runLogger(cityIds: string[]): Promise<number> {
         continue;
       }
 
-      const temps      = members.filter(m => m.date === date).map(m => m.tempMaxC);
-      const modelProbs = computeBracketProbabilities(temps, city, 0);
+      const captureTime = new Date();
+      const availableBankroll = currentForwardTestBankroll(entries);
+      if (availableBankroll < 5) {
+        console.log(`    - ${city.name} ${date} SKIP  available bankroll $${availableBankroll.toFixed(2)} below minimum order`);
+        continue;
+      }
 
       let odds: Awaited<ReturnType<typeof fetchMarketOdds>> | null = null;
-      try { odds = await fetchMarketOdds(city, date); } catch { continue; }
-      if (!odds || Object.keys(odds.probs).length === 0) continue;
+      try { odds = await fetchMarketOdds(city, date); } catch (e) {
+        console.log(`    - ${city.name} ${date} NO ODDS  error: ${(e as Error).message}`);
+        continue;
+      }
+      if (!odds || Object.keys(odds.probs).length === 0) {
+        console.log(`    - ${city.name} ${date} NO MARKET`);
+        continue;
+      }
 
-      const signals    = computeBetSignals(modelProbs, odds.probs, city, 1000);
+      const marketCity = cityWithMarketBrackets(city, odds);
+      const temps      = members.filter(m => m.date === date).map(m => m.tempMaxC);
+      const modelProbs = computeBracketProbabilities(temps, marketCity, 0);
+      const yesAskPrices = Object.fromEntries(odds.bracketMarkets.map(b => [b.bracket, b.yesAsk]));
+      const signalPrices = Object.keys(yesAskPrices).length ? yesAskPrices : odds.probs;
+      const rawSignals = computeBetSignals(modelProbs, signalPrices, marketCity, availableBankroll);
+      const totalAboveThreshold = rawSignals.filter(s => s.action === 'BUY').length;
+      const signals    = applySingleMarketKellyRecommendation(
+        rawSignals
+      );
       const buySignals = signals.filter(s => s.action === 'BUY');
 
       // --- Correlated-bet guard ---
       // All brackets on the same city+date share the same temperature draw.
       // Portfolio Kelly collapses to: bet only the single highest-conviction bracket.
       // Betting multiple brackets on the same event re-exposes to the same risk multiple times.
-      const totalAboveThreshold = buySignals.length;
       const best = buySignals.sort((a, b) => b.kellyFraction - a.kellyFraction)[0];
-      if (!best) continue;
 
-      if (isDuplicate(entries, city.name, date)) continue;
+      if (!best) {
+        // No qualifying BUY signal — show the best candidate so we know why it was skipped
+        const topSkip = signals.filter(s => s.edge > 0).sort((a, b) => b.kellyFraction - a.kellyFraction)[0];
+        if (topSkip) {
+          console.log(`    - ${city.name} ${date} NO SIGNAL  best=${topSkip.label}  edge=${(topSkip.edge*100).toFixed(1)}%  Kelly=${(topSkip.kellyFraction*100).toFixed(1)}%  reason: ${topSkip.reason}`);
+        } else {
+          console.log(`    - ${city.name} ${date} NO SIGNAL  model agrees with market (no positive edge)`);
+        }
+        continue;
+      }
+
+      if (isDuplicate(entries, city.name, date)) {
+        console.log(`    - ${city.name} ${date} SKIP (already logged)`);
+        continue;
+      }
 
       const note = totalAboveThreshold > 1
         ? `best of ${totalAboveThreshold} qualifying brackets (highest Kelly)`
@@ -273,7 +315,7 @@ async function runLogger(cityIds: string[]): Promise<number> {
         : { status: 'skipped-no-token', orderId: '' };
 
       entries.push({
-        logged_at:      new Date().toISOString(),
+        logged_at:      captureTime.toISOString(),
         city:           city.name,
         market_date:    date,
         bracket:        String(best.bracket),
@@ -289,10 +331,15 @@ async function runLogger(cityIds: string[]): Promise<number> {
         resolved:       false,
         actual_bracket: '',
         pnl:            0,
-        notes:          note,
+        notes:          [
+          note,
+          `window_open=${new Date(windowStartMs).toISOString()}`,
+          `captured_in_8h_window`,
+          `bankroll=${availableBankroll.toFixed(2)}`,
+        ].filter(Boolean).join('; '),
       });
 
-      console.log(`    + ${city.name} ${date} ${best.label}  edge=${(best.edge*100).toFixed(1)}%  EV=${(best.evPerDollar*100).toFixed(1)}¢  size=$${best.suggestedUsd.toFixed(0)}  [${orderStatus}]${totalAboveThreshold > 1 ? `  (best of ${totalAboveThreshold})` : ''}`);
+      console.log(`    + ${city.name} ${date} ${best.label}  edge=${(best.edge*100).toFixed(1)}%  EV=${(best.evPerDollar*100).toFixed(1)}¢  bankroll=$${availableBankroll.toFixed(2)}  size=$${best.suggestedUsd.toFixed(0)}  [${orderStatus}]${totalAboveThreshold > 1 ? `  (best of ${totalAboveThreshold})` : ''}`);
       added++;
     }
   }
@@ -341,12 +388,9 @@ async function runResolver(): Promise<number> {
       for (const m of markets) {
         const prices = JSON.parse(m.outcomePrices ?? '["0","1"]');
         if (parseFloat(prices[0]) === 1 && m.umaResolutionStatus === 'resolved') {
-          // This is the winning bracket — map groupItemTitle back to bracket key
-          const title = (m.groupItemTitle ?? '').trim();
-          // Normalise: "16°C" → "16", "6°C or below" → "6_or_below", "18°C or higher" → "18_or_above"
-          if (title.endsWith('°C or below'))  actualBracket = `${city.minBracket}_or_below`;
-          else if (title.endsWith('°C or higher')) actualBracket = `${city.maxBracket}_or_above`;
-          else actualBracket = title.replace('°C', '').trim();
+          // This is the winning bracket — map the resolved market title back to
+          // the same key format used when paper trades are logged.
+          actualBracket = titleToBracket(m.groupItemTitle ?? '', city) ?? '';
           break;
         }
       }
@@ -371,6 +415,12 @@ async function runResolver(): Promise<number> {
 
       const won = entry.bracket === actualBracket;
       if (won) {
+        if (entry.market_price <= 0) {
+          entry.pnl   = 0;
+          entry.notes = 'WIN - invalid entry price for P&L';
+          resolved++;
+          continue;
+        }
         // Profit: shares × ($1 − price). Shares = suggested_usd / market_price.
         const shares = entry.suggested_usd / entry.market_price;
         entry.pnl    = shares * (1 - entry.market_price);

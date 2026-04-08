@@ -16,7 +16,7 @@
  *   2. Fetch Polymarket live odds + tokenIds
  *   3. Run EV + Kelly to find actionable signals
  *   4. Check for neg-risk arbitrage (buy/sell all brackets)
- *   5. Place limit orders at current ask price for each BUY signal
+ *   5. Place a limit order at current ask price for the top Kelly BUY signal
  *
  * --- Neg-risk arbitrage execution ---
  * If arb detected (sum of YES prices < 1 after fees):
@@ -33,9 +33,9 @@ import { ENV } from '../config';
 import { createTradingClient } from '../polymarket';
 import { CityConfig, parseCityArg, CITIES } from './cities';
 import { fetchEcmwfEnsemble } from './ensemble';
-import { fetchMarketOdds, BracketMarket, MarketOdds } from './polymarket_odds';
+import { fetchMarketOdds, cityWithMarketBrackets, BracketMarket, MarketOdds } from './polymarket_odds';
 import { computeBracketProbabilities } from './brackets';
-import { computeBetSignals, detectArbOpportunity, BetSignal, KELLY_SCALE, MIN_KELLY } from './ev';
+import { applySingleMarketKellyRecommendation, computeBetSignals, detectArbOpportunity, BetSignal, KELLY_SCALE, MIN_KELLY } from './ev';
 
 // ---------------------------------------------------------------------------
 // CLI args
@@ -90,15 +90,22 @@ async function main() {
     console.log(`  Volume: $${Math.round(odds.volume).toLocaleString()}  Liquidity: $${Math.round(odds.liquidity).toLocaleString()}`);
 
     // Model probabilities
+    const marketCity = cityWithMarketBrackets(city, odds);
     const temps      = ensembleMembers.filter(m => m.date === date).map(m => m.tempMaxC);
-    const modelProbs = computeBracketProbabilities(temps, city, biasCorrection);
+    const modelProbs = computeBracketProbabilities(temps, marketCity, biasCorrection);
 
-    // EV + Kelly signals
-    const signals = computeBetSignals(modelProbs, odds.probs, city, bankrollUsd);
+    // Neg-risk arbitrage check: use executable ask-side prices, not Gamma
+    // outcomePrices/midpoints. Midpoints can show fake buy-all arb.
+    const yesAskPrices = Object.fromEntries(odds.bracketMarkets.map(b => [b.bracket, b.yesAsk]));
+    const noAskPrices  = Object.fromEntries(odds.bracketMarkets.map(b => [b.bracket, b.noAsk]));
+    const arb          = detectArbOpportunity(yesAskPrices, marketCity, 0.01, 0.02, noAskPrices);
 
-    // Neg-risk arbitrage check (use raw pre-normalised prices from bracketMarkets)
-    const rawPrices = Object.fromEntries(odds.bracketMarkets.map(b => [b.bracket, b.yesPrice]));
-    const arb       = detectArbOpportunity(rawPrices, city);
+    // EV + Kelly signals. Use executable YES asks for recommendations; the
+    // Gamma outcome price can be a stale midpoint on thin markets.
+    const signalPrices = Object.keys(yesAskPrices).length ? yesAskPrices : odds.probs;
+    const signals = applySingleMarketKellyRecommendation(
+      computeBetSignals(modelProbs, signalPrices, marketCity, bankrollUsd)
+    );
 
     results.push({ date, signals, arb });
 
@@ -144,11 +151,12 @@ async function executeBet(
   date: string,
   live: boolean,
 ): Promise<void> {
-  const size = signal.suggestedUsd / signal.marketPrice; // shares = dollars / price
+  const orderPrice = bm.yesAsk > 0 ? bm.yesAsk : signal.marketPrice;
+  const size = signal.suggestedUsd / orderPrice; // shares = dollars / price
 
   console.log(`\n  → ${live ? 'PLACING' : 'WOULD PLACE'} BUY`);
   console.log(`     Bracket:  ${signal.label}  (${date}  ${city.name})`);
-  console.log(`     Price:    ${signal.marketPrice.toFixed(3)} (${(signal.marketPrice*100).toFixed(1)}¢)`);
+  console.log(`     Price:    ${orderPrice.toFixed(3)} (${(orderPrice*100).toFixed(1)}¢ ask)`);
   console.log(`     Size:     ${size.toFixed(2)} shares  ($${signal.suggestedUsd.toFixed(2)})`);
   console.log(`     Model:    ${(signal.modelProb*100).toFixed(1)}%`);
   console.log(`     EV:       ${(signal.evPerDollar*100).toFixed(1)}¢ per dollar`);
@@ -170,7 +178,7 @@ async function executeBet(
     const resp = await client.createAndPostOrder(
       {
         tokenID: bm.yesTokenId,
-        price:   parseFloat(signal.marketPrice.toFixed(3)),
+        price:   parseFloat(orderPrice.toFixed(3)),
         size:    parseFloat(size.toFixed(2)),
         side:    Side.BUY,
       },
@@ -193,22 +201,25 @@ async function executeBuyAll(
   bankrollUsd: number,
   live: boolean,
 ): Promise<void> {
-  // For buy-all arb: invest equal $ per bracket, total = bankrollUsd * 0.1 (conservative)
+  // For buy-all arb: buy equal shares in every bracket. Equal-dollar sizing
+  // does not guarantee the same payout across outcomes.
   const totalBudget  = bankrollUsd * 0.1;
-  const perBracketUsd = totalBudget / odds.bracketMarkets.length;
+  const totalAskCost = odds.bracketMarkets.reduce((s, bm) => s + bm.yesAsk, 0);
+  const shares = totalAskCost > 0 ? totalBudget / totalAskCost : 0;
 
   console.log(`\n  → ${live ? 'EXECUTING' : 'WOULD EXECUTE'} BUY-ALL ARB`);
-  console.log(`     Total budget: $${totalBudget.toFixed(2)} ($${perBracketUsd.toFixed(2)} per bracket)`);
+  console.log(`     Total budget: $${totalBudget.toFixed(2)} (${shares.toFixed(2)} shares per bracket)`);
 
   for (const bm of odds.bracketMarkets) {
-    const size = perBracketUsd / bm.yesPrice;
-    console.log(`     ${bm.bracket.padEnd(15)} price=${bm.yesPrice.toFixed(3)}  size=${size.toFixed(2)} shares`);
+    const size = shares;
+    const cost = size * bm.yesAsk;
+    console.log(`     ${bm.bracket.padEnd(15)} price=${bm.yesAsk.toFixed(3)}  size=${size.toFixed(2)} shares  cost=$${cost.toFixed(2)}`);
 
     if (!live || !client || !bm.acceptingOrders) continue;
 
     try {
       await client.createAndPostOrder(
-        { tokenID: bm.yesTokenId, price: parseFloat(bm.yesPrice.toFixed(3)), size: parseFloat(size.toFixed(2)), side: Side.BUY },
+        { tokenID: bm.yesTokenId, price: parseFloat(bm.yesAsk.toFixed(3)), size: parseFloat(size.toFixed(2)), side: Side.BUY },
         { tickSize: bm.tickSize as any, negRisk: bm.negRisk }
       );
     } catch (err) {

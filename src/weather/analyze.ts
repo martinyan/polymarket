@@ -10,8 +10,8 @@
  */
 
 import { fetchEcmwfEnsemble, fetchKmaForecast, fetchMetOfficeEnsemble, EnsembleMember } from './ensemble';
-import { fetchMarketOdds } from './polymarket_odds';
-import { computeBracketProbabilities, computeEdgeTable, buildBrackets, bracketLabel, BracketProbabilities } from './brackets';
+import { fetchMarketOdds, MarketOdds, cityWithMarketBrackets } from './polymarket_odds';
+import { computeBracketProbabilities, computeEdgeTable, BracketProbabilities } from './brackets';
 import { fetchMonthlyAnomaly } from './gistemp';
 import { parseCityArg, CITIES } from './cities';
 
@@ -33,8 +33,6 @@ const city = parseCityArg(args);
 // Main
 // ---------------------------------------------------------------------------
 async function main() {
-  const brackets = buildBrackets(city);
-
   console.log(`\n=== Polymarket Weather Edge Analyzer — ${city.name} ===`);
   console.log(`Resolution station: ${city.wundergroundUrl}`);
   console.log(`Coordinates: ${city.lat}°N, ${city.lon}°E`);
@@ -84,14 +82,16 @@ async function main() {
   console.log('Fetching Polymarket live odds…');
   const dates = [...new Set(ecmwfMembers.map(m => m.date))].sort();
   const oddsMap: Record<string, Partial<BracketProbabilities>> = {};
+  const marketOddsMap: Record<string, MarketOdds> = {};
   const volumeMap: Record<string, number> = {};
 
   for (const date of dates) {
     try {
       const odds = await fetchMarketOdds(city, date);
       if (odds) {
-        oddsMap[date]   = odds.probs;
-        volumeMap[date] = odds.volume;
+        oddsMap[date]       = odds.probs;
+        marketOddsMap[date] = odds;
+        volumeMap[date]     = odds.volume;
         console.log(`  → ${date}: $${Math.round(odds.volume).toLocaleString()} vol, $${Math.round(odds.liquidity).toLocaleString()} liq`);
       } else {
         console.log(`  → ${date}: no market found`);
@@ -106,9 +106,10 @@ async function main() {
     const temps    = members.map(m => m.tempMaxC);
     const secondary = secondaryMembers.filter(m => m.date === date);
 
-    const modelProbs  = computeBracketProbabilities(temps, city, biasCorrection);
+    const marketCity  = marketOddsMap[date] ? cityWithMarketBrackets(city, marketOddsMap[date]) : city;
+    const modelProbs  = computeBracketProbabilities(temps, marketCity, biasCorrection);
     const marketProbs = oddsMap[date] ?? {};
-    const edgeTable   = computeEdgeTable(modelProbs, marketProbs, city);
+    const edgeTable   = computeEdgeTable(modelProbs, marketProbs, marketCity);
 
     const eMean = mean(temps);
     const eStd  = stdDev(temps);

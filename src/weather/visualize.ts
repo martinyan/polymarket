@@ -7,17 +7,19 @@
 
 import { writeFileSync, readFileSync, existsSync } from 'fs';
 import { fetchEcmwfEnsemble, fetchSecondaryForecast, EnsembleMember } from './ensemble';
-import { fetchMarketOdds, MarketOdds } from './polymarket_odds';
+import { fetchMarketOdds, cityWithMarketBrackets, MarketOdds } from './polymarket_odds';
 import { computeBracketProbabilities, computeEdgeTable, buildBrackets, bracketLabel, BracketProbabilities } from './brackets';
 import { fetchMonthlyAnomaly } from './gistemp';
 import { CITIES, CityConfig } from './cities';
-import { computeBetSignals, detectArbOpportunity, BetSignal, ArbSignal } from './ev';
+import { applySingleMarketKellyRecommendation, computeBetSignals, detectArbOpportunity, BetSignal, ArbSignal } from './ev';
 import { ENV as _ENV } from '../config';
 const IS_LIVE_NOTE = _ENV.PREVIEW_MODE ? '🟡 PREVIEW MODE — no real orders placed' : '🔴 LIVE MODE — real orders placed';
 
 // ---------------------------------------------------------------------------
-// 12-hour trade window helpers (mirrors forwardtest.ts logic)
+// Trade window helpers (mirrors forwardtest.ts logic)
 // ---------------------------------------------------------------------------
+const TRADE_WINDOW_HOURS = 8;
+
 const TZ_OFFSET_HOURS: Record<string, number> = {
   'Asia/Seoul': 9, 'Asia/Tokyo': 9, 'Asia/Shanghai': 8,
   'Asia/Jerusalem': 3, 'Europe/London': 1,
@@ -28,7 +30,7 @@ function cityDayEndUtcMs(date: string, tz: string): number {
 }
 function tradeWindowStatus(date: string, tz: string): { open: boolean; opensAt: string; closesAt: string } {
   const dayEndMs   = cityDayEndUtcMs(date, tz);
-  const openMs     = dayEndMs - 12 * 3_600_000;
+  const openMs     = dayEndMs - TRADE_WINDOW_HOURS * 3_600_000;
   const now        = Date.now();
   const fmt = (ms: number) => new Date(ms).toISOString().slice(11, 16) + ' UTC';
   return { open: now >= openMs && now < dayEndMs, opensAt: fmt(openMs), closesAt: fmt(dayEndMs) };
@@ -62,6 +64,7 @@ type DateSnapshot = {
   ensembleMean: number; ensembleStd: number; p10: number; p90: number;
   secondaryLabel: string;
   secondaryMean: number | null; secondaryStd: number | null;
+  marketCity: CityConfig;
   modelProbs: BracketProbabilities;
   marketProbs: Partial<BracketProbabilities>;
   rawPrices: Partial<BracketProbabilities>;   // un-normalised for arb detection
@@ -106,18 +109,22 @@ async function fetchCityData(city: CityConfig): Promise<CityResult> {
     const daySec   = secondaryMembers.filter(m => m.date === date);
     const temps    = dayEcmwf.map(m => m.tempMaxC);
     const secTemps = daySec.map(m => m.tempMaxC);
-    const modelProbs = computeBracketProbabilities(temps, city, biasCorrection);
 
     let odds: MarketOdds | null = null;
     try { odds = await fetchMarketOdds(city, date); } catch {}
 
-    const marketProbs = odds?.probs ?? {};
-    const rawPrices   = Object.fromEntries((odds?.bracketMarkets ?? []).map(b => [b.bracket, b.yesPrice]));
+    const marketCity  = odds ? cityWithMarketBrackets(city, odds) : city;
+    const modelProbs  = computeBracketProbabilities(temps, marketCity, biasCorrection);
+    const rawPrices   = Object.fromEntries((odds?.bracketMarkets ?? []).map(b => [b.bracket, b.yesAsk]));
+    const noAskPrices = Object.fromEntries((odds?.bracketMarkets ?? []).map(b => [b.bracket, b.noAsk]));
+    const marketProbs = Object.keys(rawPrices).length ? rawPrices : (odds?.probs ?? {});
     const volume      = odds?.volume ?? 0;
     const liquidity   = odds?.liquidity ?? 0;
 
-    const signals = computeBetSignals(modelProbs, marketProbs, city, bankrollUsd);
-    const arb     = detectArbOpportunity(rawPrices, city);
+    const signals = applySingleMarketKellyRecommendation(
+      computeBetSignals(modelProbs, marketProbs, marketCity, bankrollUsd)
+    );
+    const arb     = detectArbOpportunity(rawPrices, marketCity, 0.01, 0.02, noAskPrices);
 
     const hasMkt = Object.keys(marketProbs).length > 0;
     if (hasMkt) process.stdout.write(`$${Math.round(volume/1000)}K vol${arb ? ' 🔺ARB' : ''}\n`);
@@ -130,7 +137,7 @@ async function fetchCityData(city: CityConfig): Promise<CityResult> {
       secondaryLabel,
       secondaryMean: secTemps.length ? mean(secTemps) : null,
       secondaryStd:  secTemps.length > 1 ? stdDev(secTemps) : null,
-      modelProbs, marketProbs, rawPrices,
+      marketCity, modelProbs, marketProbs, rawPrices,
       members: temps, volume, liquidity, signals, arb,
     });
   }
@@ -346,13 +353,14 @@ function buildCityPanel(r: CityResult): string {
 }
 
 function buildCard(s: DateSnapshot, city: CityConfig): string {
+  const marketCity = s.marketCity;
   const hasMkt    = Object.keys(s.marketProbs).length > 0;
-  const edgeRows  = computeEdgeTable(s.modelProbs, s.marketProbs, city)
+  const edgeRows  = computeEdgeTable(s.modelProbs, s.marketProbs, marketCity)
     .filter(r => r.modelProb > 0 || r.marketProb > 0);
   const volStr    = s.volume ? `$${Math.round(s.volume/1000)}K vol · $${Math.round(s.liquidity/1000)}K liq` : 'no market';
   const win       = tradeWindowStatus(s.date, city.timezone);
   const dayEndMs  = cityDayEndUtcMs(s.date, city.timezone);
-  const openMs    = dayEndMs - 12 * 3_600_000;
+  const openMs    = dayEndMs - TRADE_WINDOW_HOURS * 3_600_000;
   // Embed UTC epoch timestamps as data attrs — client JS updates every second
   const winBadge  = `<span class="win-badge" data-open="${openMs}" data-close="${dayEndMs}" style="border-radius:5px;padding:2px 9px;font-size:.7rem">loading…</span>`;
 
@@ -369,7 +377,7 @@ function buildCard(s: DateSnapshot, city: CityConfig): string {
     const border   = isBuy ? '#3b82f6' : '#f97316';
     const icon     = isBuy ? '🟢' : '🟠';
     const label    = isBuy ? 'BUY-ALL ARB (sum &lt; 1)' : 'SELL-ALL ARB (sum &gt; 1)';
-    const noCost   = arb.brackets.reduce((a, b) => a + (1 - b.price), 0);
+    const noCost   = arb.brackets.reduce((a, b) => a + b.price, 0);
     const action   = isBuy
       ? `Buy YES on every bracket. Total cost = <strong>${arb.sumOfYesPrices.toFixed(4)}</strong>. Guaranteed $1.00 payout. Gross profit = <strong>${(arb.theoreticalProfit*100).toFixed(2)}¢/$</strong>.`
       : `Buy NO on every bracket (= short YES). NO cost = <strong>${noCost.toFixed(4)}</strong>. Payout = <strong>${arb.brackets.length - 1}.00</strong> (all NOs except the winning bracket pay $1). Gross profit = <strong>${(arb.theoreticalProfit*100).toFixed(2)}¢/$</strong>.`;
@@ -393,6 +401,7 @@ function buildCard(s: DateSnapshot, city: CityConfig): string {
   const tableRows = edgeRows.map(row => {
     const sig      = s.signals.find(x => x.bracket === row.bracket);
     const isBest   = !s.arb && row.bracket === bestBracket;
+    const isCorrSkip = sig?.reason?.startsWith('correlated with ') ?? false;
     const mktPct   = row.marketProb > 0 ? (row.marketProb*100).toFixed(1)+'%' : '<span class="neu">—</span>';
     const edgePct  = row.marketProb > 0 ? `<span class="${row.edge>0.02?'pos':row.edge<-0.02?'neg':'neu'}">${row.edge>=0?'+':''}${(row.edge*100).toFixed(1)}%</span>` : '<span class="neu">—</span>';
     const ev       = sig?.marketPrice > 0 ? `<span class="${sig.evPerDollar>=0?'pos':'neg'}">${sig.evPerDollar>=0?'+':''}${(sig.evPerDollar*100).toFixed(1)}¢</span>` : '<span class="neu">—</span>';
@@ -402,7 +411,7 @@ function buildCard(s: DateSnapshot, city: CityConfig): string {
       ? `<span class="b-arb">ARB</span>`
       : isBest
         ? `<span class="b-buy">BUY ★</span>`
-        : sig?.action === 'BUY'
+        : isCorrSkip
           ? `<span class="b-skip" title="Skipped: correlated with best bracket">SKIP (corr.)</span>`
           : `<span class="b-skip">${sig?.reason ?? ''}</span>`;
 
@@ -447,13 +456,14 @@ function buildCard(s: DateSnapshot, city: CityConfig): string {
     <thead><tr><th>Bracket</th><th>Model</th><th>Market</th><th>Edge</th><th>EV/¢$</th><th>Kelly</th><th>Size</th><th>Action</th></tr></thead>
     <tbody>${tableRows}</tbody>
   </table>
-  ${buySignals.length > 1 ? `<div style="font-size:.71rem;color:#64748b;margin-top:7px">★ = best bracket logged. Other qualifying brackets skipped — all share the same temperature draw (correlated risk). Min market price: 5¢.</div>` : ''}
+  ${s.signals.some(x => x.reason?.startsWith('correlated with ')) ? `<div style="font-size:.71rem;color:#64748b;margin-top:7px">★ = single recommended bracket. Other qualifying brackets skipped — all share the same temperature draw (correlated risk). Min market price: 5¢.</div>` : ''}
 </div>`;
 }
 
 function buildChartJs(s: DateSnapshot, city: CityConfig): string {
-  const brackets  = buildBrackets(city);
-  const labels    = brackets.map(b => bracketLabel(b, city));
+  const marketCity = s.marketCity;
+  const brackets  = buildBrackets(marketCity);
+  const labels    = brackets.map(b => bracketLabel(b, marketCity));
   const modelData = brackets.map(b => +((s.modelProbs[b] ?? 0)*100).toFixed(2));
   const mktData   = brackets.map(b => +((s.marketProbs[b] ?? 0)*100).toFixed(2));
 

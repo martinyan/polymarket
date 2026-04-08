@@ -50,8 +50,8 @@ export type ArbSignal = {
   type: 'buy_all' | 'sell_all';
   sumOfYesPrices: number;
   theoreticalProfit: number;   // per $1 notional
-  profitAfterFees: number;     // assuming 1% taker fee per leg
-  brackets: Array<{ bracket: Bracket; label: string; price: number }>;
+  profitAfterFees: number;     // after taker fee on dollars traded
+  brackets: Array<{ bracket: Bracket; label: string; price: number }>; // YES ask for buy_all, NO ask for sell_all
 };
 
 /**
@@ -138,6 +138,35 @@ export function computeBetSignals(
 }
 
 /**
+ * Temperature brackets in the same city+date market are mutually exclusive.
+ * Multiple positive-Kelly brackets are not independent bets; for the trade
+ * recommendation path, keep only the single highest-Kelly bracket actionable.
+ */
+export function applySingleMarketKellyRecommendation(signals: BetSignal[]): BetSignal[] {
+  const buySignals = signals.filter(s => s.action === 'BUY');
+  if (buySignals.length <= 1) return signals;
+
+  const [best] = [...buySignals].sort((a, b) =>
+    b.kellyFraction - a.kellyFraction ||
+    b.evPerDollar - a.evPerDollar ||
+    b.edge - a.edge
+  );
+
+  return signals.map(signal => {
+    if (signal.action !== 'BUY' || signal.bracket === best.bracket) return signal;
+    return {
+      ...signal,
+      action: 'SKIP' as const,
+      reason: `correlated with ${best.label}; single-market Kelly selects highest Kelly`,
+    };
+  }).sort((a, b) => {
+    if (a.action === 'BUY' && b.action !== 'BUY') return -1;
+    if (b.action === 'BUY' && a.action !== 'BUY') return 1;
+    return b.evPerDollar - a.evPerDollar;
+  });
+}
+
+/**
  * Scan for neg-risk arbitrage.
  *
  * In a neg-risk market, exactly one bracket resolves YES.
@@ -149,56 +178,63 @@ export function computeBetSignals(
  * Polymarket charges a ~1% taker fee per leg, which eats into arb profit.
  * Only flag if profit after fees is positive.
  *
- * @param marketProbs  Raw (un-normalised) YES prices per bracket
+ * @param yesBuyPrices Executable YES buy prices per bracket (ask side)
  * @param city
  * @param takerFeePct  Fee as decimal (default 0.01 = 1%)
+ * @param noBuyPrices  Executable NO buy prices per bracket (ask side), for sell-all detection
  */
 export function detectArbOpportunity(
-  marketProbs: Partial<BracketProbabilities>,
+  yesBuyPrices: Partial<BracketProbabilities>,
   city: CityConfig,
   takerFeePct = 0.01,
   // Minimum gap after fees before flagging as actionable.
-  // 0.1% threshold avoids false positives from stale midpoint prices on
-  // thinly-traded future markets — the Gamma API returns last-trade midpoints,
-  // not live CLOB bids. Only flag when the gap is large enough to survive
-  // realistic bid-ask slippage AND fees.
+  // Use executable bid/ask-side prices here. Midpoints and last-trade prices
+  // produce false positives on thinly traded future markets.
   minProfitAfterFees = 0.02,   // 2¢ per dollar minimum
+  noBuyPrices?: Partial<BracketProbabilities>,
 ): ArbSignal | null {
   const brackets    = buildBrackets(city);
-  const activePairs = brackets
-    .map(b => ({ bracket: b, label: bracketLabel(b, city), price: marketProbs[b] ?? 0 }))
+  const yesPairs = brackets
+    .map(b => ({ bracket: b, label: bracketLabel(b, city), price: yesBuyPrices[b] ?? 0 }))
     .filter(x => x.price > 0);
 
   // Need all brackets active — a missing bracket breaks the guarantee
   const expectedCount = brackets.length;
-  if (activePairs.length < expectedCount) return null;
+  if (yesPairs.length < expectedCount) return null;
 
-  const sumPrices = activePairs.reduce((s, x) => s + x.price, 0);
+  const sumYesBuyPrices = yesPairs.reduce((s, x) => s + x.price, 0);
 
   // Buy-all arb: sum of YES prices < $1
   // Action: buy YES for every bracket for guaranteed $1 payout.
   // Fee = 1% taker on total spend (not per-leg — it's a % of dollars traded).
-  if (sumPrices < 1) {
-    const grossProfit = 1 - sumPrices;
-    const totalFees   = sumPrices * takerFeePct;
+  if (sumYesBuyPrices < 1) {
+    const grossProfit = 1 - sumYesBuyPrices;
+    const totalFees   = sumYesBuyPrices * takerFeePct;
     const profitAfter = grossProfit - totalFees;
     if (profitAfter >= minProfitAfterFees) {
-      return { type: 'buy_all', sumOfYesPrices: sumPrices, theoreticalProfit: grossProfit, profitAfterFees: profitAfter, brackets: activePairs };
+      return { type: 'buy_all', sumOfYesPrices: sumYesBuyPrices, theoreticalProfit: grossProfit, profitAfterFees: profitAfter, brackets: yesPairs };
     }
   }
 
-  // Sell-all arb: sum of YES prices > $1
-  // Action: buy NO for every bracket (economically = short YES on all brackets).
-  // NO portfolio cost = sum(1 - yesPrice) = N - sumYes.
+  // Sell-all arb: buy NO for every bracket (economically = short YES on all brackets).
+  // Use executable NO asks when available; as a backward-compatible fallback,
+  // derive NO cost from YES prices. The fallback is only suitable for tests or
+  // callers that intentionally pass executable YES sell-side prices.
   // NO portfolio payout = N - 1 (all NOs pay $1 except the one that resolves YES).
-  // Gross profit = (N-1) - (N - sumYes) = sumYes - 1.
-  if (sumPrices > 1) {
-    const grossProfit = sumPrices - 1;
-    const noCost      = activePairs.reduce((s, x) => s + (1 - x.price), 0);
+  const noPairs = (noBuyPrices
+    ? brackets.map(b => ({ bracket: b, label: bracketLabel(b, city), price: noBuyPrices[b] ?? 0 }))
+    : yesPairs.map(x => ({ ...x, price: 1 - x.price }))
+  ).filter(x => x.price > 0);
+  if (noPairs.length < expectedCount) return null;
+
+  const noCost = noPairs.reduce((s, x) => s + x.price, 0);
+  const noPayout = expectedCount - 1;
+  if (noCost < noPayout) {
+    const grossProfit = noPayout - noCost;
     const totalFees   = noCost * takerFeePct;
     const profitAfter = grossProfit - totalFees;
     if (profitAfter >= minProfitAfterFees) {
-      return { type: 'sell_all', sumOfYesPrices: sumPrices, theoreticalProfit: grossProfit, profitAfterFees: profitAfter, brackets: activePairs };
+      return { type: 'sell_all', sumOfYesPrices: expectedCount - noCost, theoreticalProfit: grossProfit, profitAfterFees: profitAfter, brackets: noPairs };
     }
   }
 

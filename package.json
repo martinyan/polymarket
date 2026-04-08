@@ -11,7 +11,7 @@
     "start": "node dist/index.js",
     "check": "tsx src/check.ts",
     "preview:once": "tsx src/preview.ts",
-    "test": "tsx --test src/activity.test.ts src/bot.test.ts src/strategy.test.ts",
+    "test": "tsx --test src/activity.test.ts src/bot.test.ts src/strategy.test.ts src/weather/ev.test.ts",
     "weather": "tsx src/weather/analyze.ts",
     "weather:viz": "tsx src/weather/visualize.ts",
     "weather:bet": "tsx src/weather/bet.ts",

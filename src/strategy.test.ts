@@ -15,7 +15,16 @@ function withEnv<T>(overrides: Partial<typeof ENV>, fn: () => T): T {
     BLOCKED_SLUGS: [...ENV.BLOCKED_SLUGS]
   };
 
-  Object.assign(ENV, overrides);
+  Object.assign(ENV, {
+    BUY_ONLY: true,
+    MAX_ORDER_USD: 25,
+    MIN_ORDER_USD: 1,
+    COPY_RATIO: 0.1,
+    ALLOWED_TAGS: [],
+    ALLOWED_EVENT_KEYWORDS: [],
+    BLOCKED_SLUGS: [],
+    ...overrides
+  });
 
   try {
     return fn();

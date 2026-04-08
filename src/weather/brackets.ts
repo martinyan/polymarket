@@ -13,13 +13,23 @@ export type Bracket = string; // e.g. "6_or_below", "12", "16_or_above"
 
 export type BracketProbabilities = Record<Bracket, number>;
 
+export type TemperatureMarketTitle =
+  | { kind: 'below'; value: number }
+  | { kind: 'exact'; value: number }
+  | { kind: 'above'; value: number };
+
 /** Build the ordered list of bracket keys for a city */
 export function buildBrackets(city: CityConfig): Bracket[] {
-  const brackets: Bracket[] = [`${city.minBracket}_or_below`];
-  for (let t = city.minBracket + 1; t < city.maxBracket; t++) {
+  return buildBracketsFromBounds(city.minBracket, city.maxBracket);
+}
+
+/** Build the ordered list of bracket keys for explicit market bounds. */
+export function buildBracketsFromBounds(minBracket: number, maxBracket: number): Bracket[] {
+  const brackets: Bracket[] = [`${minBracket}_or_below`];
+  for (let t = minBracket + 1; t < maxBracket; t++) {
     brackets.push(String(t));
   }
-  brackets.push(`${city.maxBracket}_or_above`);
+  brackets.push(`${maxBracket}_or_above`);
   return brackets;
 }
 
@@ -42,16 +52,31 @@ export function tempToBracket(tempC: number, city: CityConfig): Bracket {
 }
 
 /**
- * Parse a Gamma API groupItemTitle like "13°C" or "8°C or below" into a bracket key.
- * Works for any city.
+ * Parse a Gamma API groupItemTitle like "13°C" or "8°C or below".
+ * Polymarket shifts the 11-bracket range by city+date, so this must not rely
+ * on the city-level default bounds.
  */
-export function titleToBracket(title: string, city: CityConfig): Bracket | null {
+export function parseTemperatureMarketTitle(title: string): TemperatureMarketTitle | null {
   const t = title.trim();
-  if (t === `${city.minBracket}°C or below`) return `${city.minBracket}_or_below`;
-  if (t === `${city.maxBracket}°C or higher`) return `${city.maxBracket}_or_above`;
-  const m = t.match(/^(\d+)°C$/);
-  if (m) return m[1];
+  const below = t.match(/^(-?\d+)°C or below$/);
+  if (below) return { kind: 'below', value: Number(below[1]) };
+  const above = t.match(/^(-?\d+)°C or higher$/);
+  if (above) return { kind: 'above', value: Number(above[1]) };
+  const exact = t.match(/^(-?\d+)°C$/);
+  if (exact) return { kind: 'exact', value: Number(exact[1]) };
   return null;
+}
+
+/**
+ * Parse a Gamma API groupItemTitle into a bracket key.
+ * Works for any city/date market range.
+ */
+export function titleToBracket(title: string, _city: CityConfig): Bracket | null {
+  const parsed = parseTemperatureMarketTitle(title);
+  if (!parsed) return null;
+  if (parsed.kind === 'below') return `${parsed.value}_or_below`;
+  if (parsed.kind === 'above') return `${parsed.value}_or_above`;
+  return String(parsed.value);
 }
 
 /**
