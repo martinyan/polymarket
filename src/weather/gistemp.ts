@@ -19,7 +19,7 @@
  * gridded netCDF files are large and require scientific libraries to parse.
  */
 
-import { fetchJson } from '../http';
+import { fetchJson, fetchText } from '../http';
 import { CityConfig } from './cities';
 
 export type MonthlyAnomaly = {
@@ -124,12 +124,6 @@ async function fetchClimatologicalNormal(city: CityConfig, month: number): Promi
     normals.push(m);
   }
   return normals.reduce((a, b) => a + b, 0) / normals.length;
-}
-
-async function fetchText(url: string): Promise<string> {
-  const response = await fetch(url, { headers: { 'User-Agent': 'clean-polymarket-copy-bot/0.1' } });
-  if (!response.ok) throw new Error(`Request failed ${response.status} for ${url}`);
-  return response.text();
 }
 
 function parseGistempCsv(csv: string): { year: number; anomalyC: number } {

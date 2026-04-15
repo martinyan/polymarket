@@ -73,6 +73,10 @@ type DateSnapshot = {
   members: number[];
   volume: number; liquidity: number;
   signals: BetSignal[];
+  marketDataSource: 'live' | 'snapshot' | 'none';
+  marketDataGeneratedAt: string | null;
+  signalSource: 'live' | 'snapshot';
+  signalGeneratedAt: string | null;
   arb: ArbSignal | null;
   aviation: LiveTemperatureFloorAdjustment | null;
   taf: TafRiskOverlay | null;
@@ -108,20 +112,39 @@ type PersistedSnapshotRun = {
   generatedAt: string;
   cities: Array<{
     cityId: string;
+    generatedAt?: string;
     days: PersistedSnapshotDay[];
   }>;
 };
 
-function loadLatestSnapshotIndex(): Map<string, PersistedSnapshotDay> {
+type ForwardLogRow = {
+  logged_at: string;
+  city: string;
+  market_date: string;
+  suggested_usd: number;
+  resolved: boolean;
+  pnl: number;
+};
+
+type IndexedSnapshotDay = PersistedSnapshotDay & {
+  snapshotGeneratedAt: string | null;
+  latestRunGeneratedAt: string;
+};
+
+function loadLatestSnapshotIndex(): Map<string, IndexedSnapshotDay> {
   const snapshotPath = 'data/weather_snapshot_latest.json';
   if (!existsSync(snapshotPath)) return new Map();
   try {
     const raw = readFileSync(snapshotPath, 'utf8');
     const parsed = JSON.parse(raw) as PersistedSnapshotRun;
-    const index = new Map<string, PersistedSnapshotDay>();
+    const index = new Map<string, IndexedSnapshotDay>();
     for (const city of parsed.cities ?? []) {
       for (const day of city.days ?? []) {
-        index.set(`${city.cityId}:${day.date}`, day);
+        index.set(`${city.cityId}:${day.date}`, {
+          ...day,
+          snapshotGeneratedAt: city.generatedAt ?? parsed.generatedAt ?? null,
+          latestRunGeneratedAt: parsed.generatedAt,
+        });
       }
     }
     return index;
@@ -131,6 +154,54 @@ function loadLatestSnapshotIndex(): Map<string, PersistedSnapshotDay> {
 }
 
 const latestSnapshotIndex = loadLatestSnapshotIndex();
+const forwardTestState = loadForwardTestState();
+
+function loadForwardTestState(): {
+  entries: ForwardLogRow[];
+  unresolvedKeys: Set<string>;
+  bankrollUsd: number;
+  startedAt: string | null;
+} {
+  const csvPath = 'data/forward_test_log.csv';
+  if (!existsSync(csvPath)) {
+    return { entries: [], unresolvedKeys: new Set<string>(), bankrollUsd: 1000, startedAt: null };
+  }
+
+  const raw = readFileSync(csvPath, 'utf8').trim();
+  if (!raw) {
+    return { entries: [], unresolvedKeys: new Set<string>(), bankrollUsd: 1000, startedAt: null };
+  }
+
+  const lines = raw.split('\n');
+  if (lines.length <= 1) {
+    return { entries: [], unresolvedKeys: new Set<string>(), bankrollUsd: 1000, startedAt: null };
+  }
+
+  const entries: ForwardLogRow[] = lines.slice(1).map(line => {
+    const cols = line.split(',');
+    const hasOrderCols = cols.length >= 17;
+    const base = hasOrderCols ? 2 : 0;
+    return {
+      logged_at: cols[0] ?? '',
+      city: cols[1] ?? '',
+      market_date: cols[2] ?? '',
+      suggested_usd: parseFloat(cols[10] ?? '0'),
+      resolved: cols[11 + base] === 'true',
+      pnl: parseFloat(cols[13 + base] ?? '0'),
+    };
+  });
+
+  const unresolvedKeys = new Set(entries.filter(entry => !entry.resolved).map(entry => `${entry.city}|${entry.market_date}`));
+  const closedPnl = entries.filter(entry => entry.resolved).reduce((sum, entry) => sum + entry.pnl, 0);
+  const openRisk = entries.filter(entry => !entry.resolved).reduce((sum, entry) => sum + entry.suggested_usd, 0);
+
+  return {
+    entries,
+    unresolvedKeys,
+    bankrollUsd: Math.max(0, 1000 + closedPnl - openRisk),
+    startedAt: entries[0]?.logged_at ?? null,
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Data fetching
@@ -201,31 +272,47 @@ async function fetchCityData(city: CityConfig): Promise<CityResult> {
     const snapshotDay = latestSnapshotIndex.get(`${city.id}:${date}`);
     const rawPrices   = Object.fromEntries((odds?.bracketMarkets ?? []).map(b => [b.bracket, b.yesAsk]));
     const noAskPrices = Object.fromEntries((odds?.bracketMarkets ?? []).map(b => [b.bracket, b.noAsk]));
-    const liveMarketProbs = Object.keys(rawPrices).length ? rawPrices : (odds?.probs ?? {});
-    const marketProbs = Object.keys(snapshotDay?.marketProbs ?? {}).length
-      ? snapshotDay!.marketProbs
-      : liveMarketProbs;
-    const volume      = snapshotDay?.volume ?? odds?.volume ?? 0;
-    const liquidity   = snapshotDay?.liquidity ?? odds?.liquidity ?? 0;
+    const hasLiveBookPrices = Object.keys(rawPrices).length > 0;
+    const liveMarketProbs = hasLiveBookPrices ? rawPrices : (odds?.probs ?? {});
+    const hasLiveMarketProbs = Object.keys(liveMarketProbs).length > 0;
+    const marketProbs = hasLiveMarketProbs
+      ? liveMarketProbs
+      : (snapshotDay?.marketProbs ?? {});
+    const marketDataSource: DateSnapshot['marketDataSource'] = hasLiveMarketProbs
+      ? 'live'
+      : snapshotDay
+        ? 'snapshot'
+        : 'none';
+    const marketDataGeneratedAt = hasLiveMarketProbs
+      ? new Date().toISOString()
+      : (snapshotDay?.snapshotGeneratedAt ?? snapshotDay?.latestRunGeneratedAt ?? null);
+    const volume      = typeof odds?.volume === 'number' ? odds.volume : (snapshotDay?.volume ?? 0);
+    const liquidity   = typeof odds?.liquidity === 'number' ? odds.liquidity : (snapshotDay?.liquidity ?? 0);
 
     const computedSignals = applyTafRiskToSignals(applySingleMarketKellyRecommendation(
       computeBetSignals(modelProbs, marketProbs, marketCity, bankrollUsd)
     ), tafOverlay);
-    const signals: BetSignal[] = (snapshotDay?.signals ?? []).length
-      ? snapshotDay!.signals.map(signal => ({
-          bracket: signal.bracket,
-          label: signal.label,
-          modelProb: signal.modelProb,
-          marketPrice: signal.marketPrice,
-          edge: signal.edge,
-          evPerDollar: signal.evPerDollar,
-          kellyFraction: signal.kellyFraction,
-          scaledKelly: signal.kellyFraction * 0.25,
-          suggestedUsd: signal.suggestedUsd,
-          action: signal.action as BetSignal['action'],
-          reason: signal.reason,
-        }))
-      : computedSignals;
+    const signals: BetSignal[] = hasLiveMarketProbs
+      ? computedSignals
+      : (snapshotDay?.signals ?? []).length
+        ? snapshotDay!.signals.map(signal => ({
+            bracket: signal.bracket,
+            label: signal.label,
+            modelProb: signal.modelProb,
+            marketPrice: signal.marketPrice,
+            edge: signal.edge,
+            evPerDollar: signal.evPerDollar,
+            kellyFraction: signal.kellyFraction,
+            scaledKelly: signal.kellyFraction * 0.25,
+            suggestedUsd: signal.suggestedUsd,
+            action: signal.action as BetSignal['action'],
+            reason: signal.reason,
+          }))
+        : computedSignals;
+    const signalSource: DateSnapshot['signalSource'] = hasLiveMarketProbs ? 'live' : 'snapshot';
+    const signalGeneratedAt = hasLiveMarketProbs
+      ? new Date().toISOString()
+      : (snapshotDay?.snapshotGeneratedAt ?? snapshotDay?.latestRunGeneratedAt ?? null);
     const arb     = detectArbOpportunity(rawPrices, marketCity, 0.01, 0.02, noAskPrices);
 
     const hasMkt = Object.keys(marketProbs).length > 0;
@@ -240,7 +327,7 @@ async function fetchCityData(city: CityConfig): Promise<CityResult> {
       secondaryMean: secTemps.length ? mean(secTemps) : null,
       secondaryStd:  secTemps.length > 1 ? stdDev(secTemps) : null,
       marketCity, modelProbs, marketProbs, rawPrices,
-      members: temps, volume, liquidity, signals, arb, aviation: metarFloor.adjustment, taf: tafOverlay, postprocess: calibration.adjustment,
+      members: temps, volume, liquidity, signals, marketDataSource, marketDataGeneratedAt, signalSource, signalGeneratedAt, arb, aviation: metarFloor.adjustment, taf: tafOverlay, postprocess: calibration.adjustment,
     });
   }
 
@@ -259,7 +346,17 @@ async function main() {
 
   console.log(`\nFetching data for: ${cities.map(c => c.name).join(', ')}\n`);
   const results: CityResult[] = [];
-  for (const city of cities) results.push(await fetchCityData(city));
+  for (const city of cities) {
+    try {
+      results.push(await fetchCityData(city));
+    } catch (error) {
+      console.error(`  [${city.name}] skipped: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  if (!results.length) {
+    throw new Error('No city data available; refusing to overwrite portal with an empty report');
+  }
 
   writeFileSync(outPath, buildHtml(results), 'utf8');
   console.log(`\nReport → ${outPath}`);
@@ -269,7 +366,9 @@ async function main() {
 // HTML
 // ---------------------------------------------------------------------------
 function buildHtml(results: CityResult[]): string {
-  const generatedAt = new Date().toUTCString();
+  const generatedDate = new Date();
+  const generatedAt = generatedDate.toUTCString();
+  const generatedAtIso = generatedDate.toISOString();
   const totalBuys   = results.flatMap(r => r.snapshots.flatMap(s => s.signals.filter(x => x.action === 'BUY'))).length;
   const totalArbs   = results.flatMap(r => r.snapshots.filter(s => s.arb)).length;
   const coreCount   = results.filter(r => r.city.launchPhase === 'core').length;
@@ -349,6 +448,8 @@ a.stn:hover{text-decoration:underline}
 .chips{display:flex;flex-wrap:wrap;gap:7px;margin-bottom:14px}
 .chip{background:#0f172a;border:1px solid #334155;border-radius:6px;padding:3px 9px;font-size:.75rem;color:#94a3b8}
 .chip strong{color:#e2e8f0}
+.chip-warn{background:#3f1d1d;border-color:#7f1d1d;color:#fecaca}
+.chip-warn strong{color:#fff1f2}
 /* section labels */
 .sl{font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:#475569;margin-bottom:7px}
 /* charts */
@@ -373,6 +474,7 @@ tr:last-child td{border-bottom:none}
 
 <div class="meta">
   <span>📅 <strong>${generatedAt}</strong></span>
+  <span id="portal-age" data-generated-at="${generatedAtIso}">Freshness: <strong>just generated</strong></span>
   <span>⚖️ Bias: <strong>${biasCorrection>=0?'+':''}${biasCorrection}°C</strong></span>
   <span>💰 Bankroll: <strong>$${bankrollUsd.toLocaleString()}</strong></span>
   <span class="badge-sum">✅ ${totalBuys} BUY signal${totalBuys!==1?'s':''}</span>
@@ -405,6 +507,12 @@ ${chartInits}
 // ---------------------------------------------------------------------------
 // Live trade-window countdown (updates every second, no server round-trip)
 // ---------------------------------------------------------------------------
+function fmtAge(ms){
+  if(ms < 60_000) return Math.max(1, Math.floor(ms/1000))+'s old';
+  if(ms < 3_600_000) return Math.floor(ms/60_000)+'m old';
+  if(ms < 86_400_000) return Math.floor(ms/3_600_000)+'h '+String(Math.floor((ms%3_600_000)/60_000)).padStart(2,'0')+'m old';
+  return Math.floor(ms/86_400_000)+'d '+String(Math.floor((ms%86_400_000)/3_600_000)).padStart(2,'0')+'h old';
+}
 function fmtDuration(ms){
   if(ms<=0) return '0m';
   const h=Math.floor(ms/3600000), m=Math.floor((ms%3600000)/60000), s=Math.floor((ms%60000)/1000);
@@ -414,6 +522,13 @@ function fmtDuration(ms){
 }
 function updateWindows(){
   const now=Date.now();
+  const ageEl=document.getElementById('portal-age');
+  if(ageEl){
+    const generatedAt=Date.parse(ageEl.dataset.generatedAt || '');
+    if(Number.isFinite(generatedAt)){
+      ageEl.innerHTML='Freshness: <strong>'+fmtAge(Math.max(0, now-generatedAt))+'</strong>';
+    }
+  }
   document.querySelectorAll('.win-badge').forEach(el=>{
     const openMs=parseInt(el.dataset.open), closeMs=parseInt(el.dataset.close);
     if(now>=closeMs){
@@ -446,6 +561,74 @@ function cityVolLabel(r: CityResult): string {
   if (buys > 0) parts.push(`${buys} BUY`);
   if (arbs > 0) parts.push(`${arbs} ARB`);
   return parts.join(' · ');
+}
+
+function formatAgeCompact(iso: string | null): string {
+  if (!iso) return '';
+  const ageMs = Date.now() - new Date(iso).getTime();
+  if (!Number.isFinite(ageMs) || ageMs < 0) return '';
+  if (ageMs < 60_000) return 'just now';
+  if (ageMs < 3_600_000) return `${Math.floor(ageMs / 60_000)}m old`;
+  if (ageMs < 86_400_000) return `${Math.floor(ageMs / 3_600_000)}h ${String(Math.floor((ageMs % 3_600_000) / 60_000)).padStart(2, '0')}m old`;
+  return `${Math.floor(ageMs / 86_400_000)}d ${String(Math.floor((ageMs % 86_400_000) / 3_600_000)).padStart(2, '0')}h old`;
+}
+
+function isOlderThanMinutes(iso: string | null, minutes: number): boolean {
+  if (!iso) return false;
+  const ageMs = Date.now() - new Date(iso).getTime();
+  return Number.isFinite(ageMs) && ageMs > minutes * 60_000;
+}
+
+function forwardEligibilityForSnapshot(s: DateSnapshot, city: CityConfig): {
+  status: 'eligible_now' | 'window_not_open' | 'duplicate' | 'bankroll' | 'no_buy';
+  label: string;
+  detail: string;
+} {
+  const bestBuy = s.signals.find(signal => signal.action === 'BUY');
+  if (!bestBuy) {
+    return {
+      status: 'no_buy',
+      label: 'No Forward-Test Trade',
+      detail: 'No BUY survived the forward-test thresholds after Kelly, EV, and single-market selection.',
+    };
+  }
+
+  const dayEndMs = cityDayEndUtcMs(s.date, city.timezone);
+  const openMs = tradeWindowOpenUtcMs(s.date, city.timezone, TRADE_WINDOW_HOURS);
+  const nowMs = Date.now();
+  if (nowMs < openMs) {
+    return {
+      status: 'window_not_open',
+      label: 'Blocked: Window Not Open',
+      detail: `Forward test only logs within the final ${TRADE_WINDOW_HOURS}h window. Opens ${new Date(openMs).toISOString()}.`,
+    };
+  }
+  if (nowMs >= dayEndMs) {
+    return {
+      status: 'window_not_open',
+      label: 'Blocked: Market Closed',
+      detail: 'This event is already past the local market day close, so forward test will not open a new paper trade.',
+    };
+  }
+  if (forwardTestState.bankrollUsd < 5) {
+    return {
+      status: 'bankroll',
+      label: 'Blocked: Bankroll',
+      detail: `Available forward-test bankroll is $${forwardTestState.bankrollUsd.toFixed(2)}, below the $5 minimum order.`,
+    };
+  }
+  if (forwardTestState.unresolvedKeys.has(`${city.name}|${s.date}`)) {
+    return {
+      status: 'duplicate',
+      label: 'Blocked: Already Logged',
+      detail: 'Forward test allows only one unresolved position per city/date event, so this card cannot log another paper trade yet.',
+    };
+  }
+  return {
+    status: 'eligible_now',
+    label: 'Forward-Test Eligible Now',
+    detail: `Best bracket ${bestBuy.label} passes thresholds and can be logged now at current bankroll $${forwardTestState.bankrollUsd.toFixed(2)}.`,
+  };
 }
 
 function buildCityPanel(r: CityResult): string {
@@ -499,6 +682,14 @@ function buildCard(s: DateSnapshot, city: CityConfig): string {
   const postChip = s.postprocess
     ? `<div class="chip">MOS shift <strong>${s.postprocess.shiftC >= 0 ? '+' : ''}${s.postprocess.shiftC.toFixed(1)}°C</strong></div>`
     : '';
+  const marketAge = formatAgeCompact(s.marketDataGeneratedAt);
+  const signalAge = formatAgeCompact(s.signalGeneratedAt);
+  const marketStale = isOlderThanMinutes(s.marketDataGeneratedAt, 30);
+  const signalStale = isOlderThanMinutes(s.signalGeneratedAt, 30);
+  const marketSourceChip = `<div class="chip${marketStale ? ' chip-warn' : ''}">Market <strong>${s.marketDataSource === 'live' ? 'live asks' : s.marketDataSource === 'snapshot' ? 'snapshot fallback' : 'missing'}</strong>${marketAge ? ` · ${marketAge}` : ''}</div>`;
+  const signalSourceChip = `<div class="chip${signalStale ? ' chip-warn' : ''}">Signals <strong>${s.signalSource === 'live' ? 'fresh' : 'cached'}</strong>${signalAge ? ` · ${signalAge}` : ''}</div>`;
+  const forwardEligibility = forwardEligibilityForSnapshot(s, city);
+  const forwardChip = `<div class="chip${forwardEligibility.status === 'eligible_now' ? '' : ' chip-warn'}">Forward test <strong>${forwardEligibility.status === 'eligible_now' ? 'eligible now' : 'blocked'}</strong></div>`;
   const aviationChip = s.aviation
     ? `<div class="chip">Obs max-so-far <strong>${s.aviation.observedMaxSoFarC.toFixed(1)}°C · ${s.aviation.observationCount} METARs</strong></div>`
     : '';
@@ -576,10 +767,18 @@ function buildCard(s: DateSnapshot, city: CityConfig): string {
     <span class="vol">${volStr}</span>
   </div>
   ${arbHtml}
+  <div class="arb-banner" style="background:${forwardEligibility.status === 'eligible_now' ? '#0f2f1f' : '#3f1d1d'};border-color:${forwardEligibility.status === 'eligible_now' ? '#166534' : '#7f1d1d'}">
+    <div class="arb-title" style="color:${forwardEligibility.status === 'eligible_now' ? '#86efac' : '#fecaca'}">${forwardEligibility.label}</div>
+    <div class="arb-detail" style="color:${forwardEligibility.status === 'eligible_now' ? '#bbf7d0' : '#fecaca'}">${esc(forwardEligibility.detail)}</div>
+  </div>
+  ${s.marketDataSource !== 'live' ? `<div class="arb-banner" style="background:#3f1d1d;border-color:#7f1d1d"><div class="arb-title" style="color:#fecaca">Stale market fallback</div><div class="arb-detail" style="color:#fecaca">Live market odds were unavailable during this rebuild, so this card is using the last good cached snapshot${marketAge ? ` captured ${marketAge}` : ''}.</div></div>` : ''}
   ${s.postprocess ? `<div class="arb-banner"><div class="arb-title">Station post-processor</div><div class="arb-detail">Shift ${s.postprocess.shiftC >= 0 ? '+' : ''}${s.postprocess.shiftC.toFixed(2)}°C · rmse ${s.postprocess.rmseC.toFixed(2)}°C · n=${s.postprocess.sampleCount}</div></div>` : ''}
   ${s.aviation ? `<div class="arb-banner"><div class="arb-title">Aviation station overlay</div><div class="arb-detail">${esc(s.aviation.summary)} · report ${esc(s.aviation.reportTime)}</div></div>` : ''}
   ${s.taf && s.taf.multiplier < 1 ? `<div class="arb-banner"><div class="arb-title">TAF uncertainty overlay</div><div class="arb-detail">${esc(s.taf.summary)}</div></div>` : ''}
   <div class="chips">
+    ${marketSourceChip}
+    ${signalSourceChip}
+    ${forwardChip}
     <div class="chip">ECMWF <strong>${s.ensembleMean.toFixed(1)}°C</strong></div>
     <div class="chip">σ <strong>±${s.ensembleStd.toFixed(1)}°C</strong></div>
     <div class="chip">p10 <strong>${s.p10.toFixed(1)}°C</strong></div>
@@ -704,6 +903,7 @@ function buildAuditPanel(): string {
   <div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:22px">
     ${statCard('Signals', String(rows.length))}
     ${statCard('Tracked cities', String(PORTAL_CITY_IDS.length), '#93c5fd')}
+    ${statCard('Bankroll', '$'+forwardTestState.bankrollUsd.toFixed(2), '#e2e8f0')}
     ${statCard('Order mode', orderMode, livePlaced > 0 ? '#f87171' : '#fbbf24')}
     ${statCard('Orders placed', String(livePlaced), livePlaced > 0 ? '#4ade80' : '#64748b')}
     ${statCard('Preview / Failed', `${previewCount} / ${failedCount}`, '#64748b')}
@@ -759,7 +959,7 @@ function buildAuditPanel(): string {
   return `
   <div style="margin-bottom:18px">
     <div class="city-title" style="margin-bottom:6px">Forward Test Audit Log</div>
-    <div class="city-meta">All BUY signals since ${rows[0]?.logged_at.slice(0,10) ?? '—'} · updated every 15 min · ${IS_LIVE_NOTE}</div>
+    <div class="city-meta">All BUY signals since ${forwardTestState.startedAt?.slice(0,16).replace('T',' ') ?? rows[0]?.logged_at.slice(0,10) ?? '—'} · updated every 15 min · ${IS_LIVE_NOTE}</div>
     <div class="city-meta" style="margin-top:6px">Expansion scope: 20-city Celsius universe shared with the portal tabs and forward-test logger.</div>
   </div>
   ${statCards}

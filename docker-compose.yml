@@ -30,6 +30,7 @@ services:
     #   1. snapshot         — persist exact model/market context for future analysis
     #   2. forwardtest all  — log new signals, resolve closed-out picks, print report
     #   3. visualize        — rebuild HTML dashboard so audit log always reflects latest CSV
+    #   4. health check     — log freshness status for the generated artifacts
     entrypoint: >
       sh -c "npm ci --silent &&
              while true; do
@@ -39,6 +40,8 @@ services:
                node_modules/.bin/tsx src/weather/forwardtest.ts all --city all 2>&1;
                echo \"[$(date -u '+%H:%M:%S UTC')] --- rebuilding dashboard ---\";
                node_modules/.bin/tsx src/weather/visualize.ts --city all --days 7 2>&1;
+               echo \"[$(date -u '+%H:%M:%S UTC')] --- freshness check ---\";
+               node_modules/.bin/tsx src/weather/freshness_check.ts 2>&1 || true;
                echo \"[$(date -u '+%H:%M:%S UTC')] Done. Sleeping 15 min.\";
                sleep 900;
              done"

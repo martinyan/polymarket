@@ -6,7 +6,7 @@
  * time-stamped dataset instead of depending on incomplete public history.
  */
 
-import { appendFileSync, mkdirSync, writeFileSync } from 'fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { fetchEcmwfEnsemble, fetchSecondaryForecast } from './ensemble';
 import { fetchMarketOdds, cityWithMarketBrackets } from './polymarket_odds';
 import { computeBracketProbabilities } from './brackets';
@@ -81,6 +81,7 @@ type SnapshotCity = {
   cityName: string;
   stationCode: string;
   secondaryModel: string;
+  generatedAt: string;
   days: SnapshotDay[];
 };
 
@@ -89,6 +90,8 @@ type SnapshotRun = {
   cityCount: number;
   forecastDays: number;
   cities: SnapshotCity[];
+  refreshedCityIds?: string[];
+  skippedCityIds?: string[];
 };
 
 const args = process.argv.slice(2);
@@ -96,6 +99,7 @@ const daysIdx = args.indexOf('--days');
 const forecastDays = daysIdx !== -1 ? parseInt(args[daysIdx + 1] ?? '3', 10) : 3;
 const HISTORY_PATH = 'data/weather_snapshot_history.jsonl';
 const LATEST_PATH = 'data/weather_snapshot_latest.json';
+const CITY_SNAPSHOT_DIR = 'data/weather_snapshot_latest_cities';
 const TRADE_WINDOW_HOURS = 8;
 const BANKROLL_USD = 1000;
 
@@ -215,6 +219,7 @@ async function snapshotCity(city: CityConfig): Promise<SnapshotCity> {
     cityName: city.name,
     stationCode: city.stationCode,
     secondaryModel: city.secondaryModel,
+    generatedAt: new Date().toISOString(),
     days,
   };
 }
@@ -224,29 +229,96 @@ function mean(values: number[]): number {
 }
 
 async function main(): Promise<void> {
-  const cities: SnapshotCity[] = [];
+  const refreshedCities: SnapshotCity[] = [];
+  const skippedCityIds: string[] = [];
   for (const cityId of FORWARD_TEST_CITY_IDS) {
     const city = CITIES[cityId];
     if (!city) continue;
     process.stdout.write(`  [${city.name}] snapshot… `);
-    const snapshot = await snapshotCity(city);
-    cities.push(snapshot);
-    process.stdout.write(`${snapshot.days.length} day(s)\n`);
+    try {
+      const snapshot = await snapshotCity(city);
+      refreshedCities.push(snapshot);
+      process.stdout.write(`${snapshot.days.length} day(s)\n`);
+    } catch (error) {
+      skippedCityIds.push(city.id);
+      process.stdout.write(`skipped (${error instanceof Error ? error.message : String(error)})\n`);
+    }
   }
 
-  const run: SnapshotRun = {
-    generatedAt: new Date().toISOString(),
-    cityCount: cities.length,
+  mkdirSync('data', { recursive: true });
+  mkdirSync(CITY_SNAPSHOT_DIR, { recursive: true });
+
+  for (const city of refreshedCities) {
+    writeFileSync(citySnapshotPath(city.cityId), JSON.stringify(city, null, 2), 'utf8');
+  }
+
+  const mergedCities = loadMergedLatestCities();
+  if (!mergedCities.length) {
+    throw new Error('No snapshot data collected; refusing to overwrite snapshot files');
+  }
+  if (!refreshedCities.length) {
+    throw new Error('No city snapshot refreshed in this run; keeping previous latest snapshot files untouched');
+  }
+
+  const generatedAt = new Date().toISOString();
+  const latestRun: SnapshotRun = {
+    generatedAt,
+    cityCount: mergedCities.length,
     forecastDays,
-    cities,
+    cities: mergedCities,
+    refreshedCityIds: refreshedCities.map(city => city.cityId),
+    skippedCityIds,
+  };
+  const historyRun: SnapshotRun = {
+    generatedAt,
+    cityCount: refreshedCities.length,
+    forecastDays,
+    cities: refreshedCities,
+    refreshedCityIds: refreshedCities.map(city => city.cityId),
+    skippedCityIds,
   };
 
-  mkdirSync('data', { recursive: true });
-  writeFileSync(LATEST_PATH, JSON.stringify(run, null, 2), 'utf8');
-  appendFileSync(HISTORY_PATH, JSON.stringify(run) + '\n', 'utf8');
+  writeFileSync(LATEST_PATH, JSON.stringify(latestRun, null, 2), 'utf8');
+  appendFileSync(HISTORY_PATH, JSON.stringify(historyRun) + '\n', 'utf8');
 
   console.log(`Snapshot latest → ${LATEST_PATH}`);
+  console.log(`Snapshot city cache → ${CITY_SNAPSHOT_DIR}`);
   console.log(`Snapshot history append → ${HISTORY_PATH}`);
+}
+
+function loadMergedLatestCities(): SnapshotCity[] {
+  const ids = new Set<string>(FORWARD_TEST_CITY_IDS);
+  const loaded = new Map<string, SnapshotCity>();
+
+  for (const cityId of ids) {
+    const path = citySnapshotPath(cityId);
+    if (!existsSync(path)) continue;
+    try {
+      const parsed = JSON.parse(readFileSync(path, 'utf8')) as SnapshotCity;
+      if (parsed?.cityId) {
+        loaded.set(parsed.cityId, parsed);
+      }
+    } catch {
+      // Ignore corrupt per-city cache and continue with other cities.
+    }
+  }
+
+  if (!loaded.size && existsSync(LATEST_PATH)) {
+    try {
+      const parsed = JSON.parse(readFileSync(LATEST_PATH, 'utf8')) as SnapshotRun;
+      for (const city of parsed.cities ?? []) {
+        if (city?.cityId) loaded.set(city.cityId, city);
+      }
+    } catch {
+      // Ignore corrupt merged cache when there are no city files to read.
+    }
+  }
+
+  return [...loaded.values()].sort((a, b) => FORWARD_TEST_CITY_IDS.indexOf(a.cityId) - FORWARD_TEST_CITY_IDS.indexOf(b.cityId));
+}
+
+function citySnapshotPath(cityId: string): string {
+  return `${CITY_SNAPSHOT_DIR}/${cityId}.json`;
 }
 
 if (require.main === module) {

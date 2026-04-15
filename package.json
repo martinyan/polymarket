@@ -19,7 +19,8 @@
     "weather:fwdtest": "tsx src/weather/forwardtest.ts",
     "weather:retro": "tsx src/weather/retro_backtest.ts",
     "weather:snapshot": "tsx src/weather/snapshot.ts",
-    "weather:snapshot:analyze": "tsx src/weather/snapshot_analyze.ts"
+    "weather:snapshot:analyze": "tsx src/weather/snapshot_analyze.ts",
+    "weather:health": "tsx src/weather/freshness_check.ts"
   },
   "dependencies": {
     "@polymarket/clob-client": "^5.8.1",
