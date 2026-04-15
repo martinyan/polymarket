@@ -27,11 +27,14 @@ services:
     restart: unless-stopped
     working_dir: /app
     # Schedule every 15 min:
-    #   1. forwardtest all  — log new signals, resolve closed-out picks, print report
-    #   2. visualize        — rebuild HTML dashboard so audit log always reflects latest CSV
+    #   1. snapshot         — persist exact model/market context for future analysis
+    #   2. forwardtest all  — log new signals, resolve closed-out picks, print report
+    #   3. visualize        — rebuild HTML dashboard so audit log always reflects latest CSV
     entrypoint: >
       sh -c "npm ci --silent &&
              while true; do
+               echo \"[$(date -u '+%H:%M:%S UTC')] --- snapshot ---\";
+               node_modules/.bin/tsx src/weather/snapshot.ts --days 3 2>&1;
                echo \"[$(date -u '+%H:%M:%S UTC')] --- forwardtest ---\";
                node_modules/.bin/tsx src/weather/forwardtest.ts all --city all 2>&1;
                echo \"[$(date -u '+%H:%M:%S UTC')] --- rebuilding dashboard ---\";

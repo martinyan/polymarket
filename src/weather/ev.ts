@@ -54,6 +54,22 @@ export type ArbSignal = {
   brackets: Array<{ bracket: Bracket; label: string; price: number }>; // YES ask for buy_all, NO ask for sell_all
 };
 
+export type TwoBracketBasketSignal = {
+  brackets: [Bracket, Bracket];
+  labels: [string, string];
+  modelProbabilities: [number, number];
+  marketPrices: [number, number];
+  stakeUsd: [number, number];
+  stakeFractions: [number, number];
+  totalStakeUsd: number;
+  totalStakeFraction: number;
+  expectedProfitUsd: number;
+  evPerDollar: number;
+  profitProbability: number;
+  expectedLogGrowth: number;
+  outcomeProfitUsd: [number, number];
+};
+
 /**
  * Compute EV and Kelly for every bracket in a market.
  *
@@ -164,6 +180,124 @@ export function applySingleMarketKellyRecommendation(signals: BetSignal[]): BetS
     if (b.action === 'BUY' && a.action !== 'BUY') return 1;
     return b.evPerDollar - a.evPerDollar;
   });
+}
+
+/**
+ * Expected log growth for a single YES position sized using `suggestedUsd`.
+ * This is the right comparison metric when deciding whether a structured basket
+ * is actually better than the single highest-Kelly bracket.
+ */
+export function expectedLogGrowthForSingle(signal: Pick<BetSignal, 'modelProb' | 'marketPrice' | 'suggestedUsd'>, bankrollUsd: number): number {
+  if (bankrollUsd <= 0 || signal.suggestedUsd <= 0) return Number.NEGATIVE_INFINITY;
+  const f = signal.suggestedUsd / bankrollUsd;
+  if (f <= 0 || f >= 1 || signal.marketPrice <= 0 || signal.marketPrice >= 1) return Number.NEGATIVE_INFINITY;
+  const winMultiplier = 1 - f + f / signal.marketPrice;
+  const loseMultiplier = 1 - f;
+  if (winMultiplier <= 0 || loseMultiplier <= 0) return Number.NEGATIVE_INFINITY;
+  return signal.modelProb * Math.log(winMultiplier) + (1 - signal.modelProb) * Math.log(loseMultiplier);
+}
+
+/**
+ * Two-bracket basket on the same city/date market.
+ *
+ * Let bankroll fractions be f1 and f2 on brackets 1 and 2 priced at p1 and p2.
+ * Because exactly one bracket resolves YES:
+ *   W1 = 1 - f1 - f2 + f1/p1
+ *   W2 = 1 - f1 - f2 + f2/p2
+ *   W0 = 1 - f1 - f2              (all other brackets win)
+ *
+ * Expected log growth is:
+ *   G = q1 ln(W1) + q2 ln(W2) + (1-q1-q2) ln(W0)
+ *
+ * We compare this basket against the best single-bracket trade using the same
+ * total risk budget, and only use the basket when it improves expected log growth.
+ */
+export function findBestTwoBracketBasket(
+  signals: BetSignal[],
+  bankrollUsd: number,
+  totalRiskUsd: number,
+): TwoBracketBasketSignal | null {
+  if (bankrollUsd <= 0 || totalRiskUsd < MIN_POSITION_USD * 2) return null;
+  const candidates = signals
+    .filter(signal => signal.action === 'BUY' && signal.suggestedUsd >= MIN_POSITION_USD && signal.marketPrice >= MIN_MARKET_PRICE)
+    .sort((a, b) => b.kellyFraction - a.kellyFraction || b.evPerDollar - a.evPerDollar);
+  if (candidates.length < 2) return null;
+
+  let best: TwoBracketBasketSignal | null = null;
+  const step = Math.max(1, Math.round(totalRiskUsd / 40));
+
+  for (let i = 0; i < candidates.length - 1; i++) {
+    for (let j = i + 1; j < candidates.length; j++) {
+      const a = candidates[i];
+      const b = candidates[j];
+      const totalStakeUsd = Math.min(totalRiskUsd, a.suggestedUsd + b.suggestedUsd);
+      if (totalStakeUsd < MIN_POSITION_USD * 2) continue;
+
+      const minStakeA = Math.max(MIN_POSITION_USD, totalStakeUsd - b.suggestedUsd);
+      const maxStakeA = Math.min(a.suggestedUsd, totalStakeUsd - MIN_POSITION_USD);
+      if (minStakeA > maxStakeA) continue;
+
+      for (let stakeA = minStakeA; stakeA <= maxStakeA + 1e-9; stakeA += step) {
+        const stakeB = totalStakeUsd - stakeA;
+        if (stakeB < MIN_POSITION_USD || stakeB > b.suggestedUsd) continue;
+
+        const f1 = stakeA / bankrollUsd;
+        const f2 = stakeB / bankrollUsd;
+        const totalFraction = f1 + f2;
+        if (f1 <= 0 || f2 <= 0 || totalFraction >= 1) continue;
+
+        const w1 = 1 - totalFraction + f1 / a.marketPrice;
+        const w2 = 1 - totalFraction + f2 / b.marketPrice;
+        const w0 = 1 - totalFraction;
+        if (w1 <= 0 || w2 <= 0 || w0 <= 0) continue;
+
+        const q1 = a.modelProb;
+        const q2 = b.modelProb;
+        const q0 = Math.max(0, 1 - q1 - q2);
+
+        const pnlIfA = stakeA * (1 / a.marketPrice - 1) - stakeB;
+        const pnlIfB = stakeB * (1 / b.marketPrice - 1) - stakeA;
+        const expectedProfitUsd =
+          q1 * pnlIfA +
+          q2 * pnlIfB +
+          q0 * (-totalStakeUsd);
+        const expectedLogGrowth =
+          q1 * Math.log(w1) +
+          q2 * Math.log(w2) +
+          q0 * Math.log(w0);
+        const profitProbability =
+          (pnlIfA > 0 ? q1 : 0) +
+          (pnlIfB > 0 ? q2 : 0);
+        const evPerDollar = totalStakeUsd > 0 ? expectedProfitUsd / totalStakeUsd : Number.NEGATIVE_INFINITY;
+        if (evPerDollar < MIN_EV_PER_DOLLAR) continue;
+
+        const basket: TwoBracketBasketSignal = {
+          brackets: [a.bracket, b.bracket],
+          labels: [a.label, b.label],
+          modelProbabilities: [q1, q2],
+          marketPrices: [a.marketPrice, b.marketPrice],
+          stakeUsd: [stakeA, stakeB],
+          stakeFractions: [f1, f2],
+          totalStakeUsd,
+          totalStakeFraction: totalFraction,
+          expectedProfitUsd,
+          evPerDollar,
+          profitProbability,
+          expectedLogGrowth,
+          outcomeProfitUsd: [pnlIfA, pnlIfB],
+        };
+
+        if (!best ||
+            basket.expectedLogGrowth > best.expectedLogGrowth + 1e-9 ||
+            (Math.abs(basket.expectedLogGrowth - best.expectedLogGrowth) <= 1e-9 && basket.expectedProfitUsd > best.expectedProfitUsd) ||
+            (Math.abs(basket.expectedLogGrowth - best.expectedLogGrowth) <= 1e-9 && Math.abs(basket.expectedProfitUsd - best.expectedProfitUsd) <= 1e-9 && basket.profitProbability > best.profitProbability)) {
+          best = basket;
+        }
+      }
+    }
+  }
+
+  return best;
 }
 
 /**

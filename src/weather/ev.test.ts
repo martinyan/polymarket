@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CITIES } from './cities';
-import { applySingleMarketKellyRecommendation, computeBetSignals, detectArbOpportunity } from './ev';
+import { applySingleMarketKellyRecommendation, computeBetSignals, detectArbOpportunity, expectedLogGrowthForSingle, findBestTwoBracketBasket } from './ev';
 
 const londonApr10Market = {
   ...CITIES.london,
@@ -86,4 +86,36 @@ test('single-market Kelly recommendation keeps only the highest Kelly BUY', () =
   assert.equal(buys.length, 1);
   assert.equal(buys[0].bracket, '17');
   assert.ok(recommended.some(s => s.bracket === '18_or_above' && s.reason?.includes('single-market Kelly')));
+});
+
+test('two-bracket basket can beat the best single bracket on expected log growth', () => {
+  const city = {
+    ...CITIES.london,
+    minBracket: 18,
+    maxBracket: 20,
+  };
+
+  const signals = computeBetSignals(
+    {
+      '18_or_below': 0.05,
+      '19': 0.34,
+      '20_or_above': 0.33,
+    },
+    {
+      '18_or_below': 0.08,
+      '19': 0.18,
+      '20_or_above': 0.17,
+    },
+    city,
+    1000
+  );
+
+  const singles = signals.filter(signal => signal.action === 'BUY').sort((a, b) => b.kellyFraction - a.kellyFraction);
+  assert.ok(singles.length >= 2);
+
+  const bestSingle = singles[0];
+  const basket = findBestTwoBracketBasket(signals, 1000, bestSingle.suggestedUsd);
+  assert.ok(basket);
+  assert.ok(basket!.expectedLogGrowth > expectedLogGrowthForSingle(bestSingle, 1000));
+  assert.ok(basket!.profitProbability > bestSingle.modelProb);
 });

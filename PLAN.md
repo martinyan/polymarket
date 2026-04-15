@@ -307,7 +307,33 @@ The detector in `ev.ts` requires >2¢ net profit after 1% taker fees with all br
 
 **Method:** Preview mode only. Record every BUY signal the bot would have placed, then compare against actual resolution outcomes.
 
-**Cities in scope:** Seoul, London (both already in `cities.ts`).
+**Cities in scope:** 20-city Celsius universe shared across `visualize.ts`, `forwardtest.ts`, and `cities.ts`.
+
+Core 5:
+- Seoul
+- London
+- Tel Aviv
+- Shanghai
+- Tokyo
+
+Wave 1 additions:
+- Hong Kong
+- Paris
+- Milan
+- Buenos Aires
+- Toronto
+- Wellington
+- Shenzhen
+- Beijing
+
+Wave 2 additions:
+- Singapore
+- Mexico City
+- Madrid
+- Munich
+- Jakarta
+- Kuala Lumpur
+- Busan
 
 **Parameters (frozen for the test period):**
 ```
@@ -351,12 +377,12 @@ Bias correction   = 0 (will measure actual bias during the test)
 
 Priority order:
 
-1. **Add Tel Aviv, Shanghai, Tokyo to `cities.ts`** — these are the highest-volume markets; confirm station slugs via Gamma API debug script
-2. **Build WUnderground historical scraper** — pull 2 years of RKSI and EGLC daily highs to calibrate model bias
-3. **Add DWD ICON-EU-EPS ensemble for London** — 40 members at 13km is better than ECMWF alone for European cities
-4. **Build `data/forward_test_log.csv` recorder** — automate signal logging during the test period so nothing is missed
-5. **Add NOAA GHCN-D station lookup** — cross-reference resolution station IDs to get the exact long-run climatology
-6. **Explore GraphCast forecasts** — ECMWF publishes daily; if accessible via API, use as a third model vote alongside IFS ensemble and KMA/ICON
+1. **Finish calibration for the 15 new cities** — scrape and align WUnderground history so post-processors can move beyond the original core set
+2. **Add a market discovery / refresh script** — automatically detect new Celsius weather cities and keep the portal universe current
+3. **Deepen Europe overlays** — continue improving ICON-EU / regional weighting for Paris, Milan, Madrid, and Munich
+4. **Add NOAA GHCN-D station lookup** — cross-reference resolution station IDs to get the exact long-run climatology
+5. **Explore GraphCast forecasts** — ECMWF publishes daily; if accessible via API, use as a third model vote alongside IFS ensemble and KMA/ICON
+6. **Evaluate Fahrenheit support separately** — current code is Celsius-only, so US weather cities remain out of scope for this rollout
 
 ### Working Rules (Weather Strategy)
 

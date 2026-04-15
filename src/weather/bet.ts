@@ -36,6 +36,14 @@ import { fetchEcmwfEnsemble } from './ensemble';
 import { fetchMarketOdds, cityWithMarketBrackets, BracketMarket, MarketOdds } from './polymarket_odds';
 import { computeBracketProbabilities } from './brackets';
 import { applySingleMarketKellyRecommendation, computeBetSignals, detectArbOpportunity, BetSignal, KELLY_SCALE, MIN_KELLY } from './ev';
+import { applyLiveMetarTemperatureFloor, applyTafRiskToSignals, fetchStationNowcast, fetchTafRiskOverlay, StationNowcast, TafRiskOverlay } from './aviation';
+import {
+  applyObservedFloorToProbabilities,
+  applyStationPostProcessorToTemps,
+  computePostProcessedBracketProbabilities,
+  loadStationPostProcessor,
+} from './postprocess';
+import { buildCurrentForecastFeatureRows } from './train_postprocess';
 
 // ---------------------------------------------------------------------------
 // CLI args
@@ -78,6 +86,13 @@ async function main() {
   const dates = [...new Set(ensembleMembers.map(m => m.date))].sort();
   console.log(`  → ${dates.length} forecast dates\n`);
 
+  let stationNowcast: StationNowcast | null = null;
+  try { stationNowcast = await fetchStationNowcast(city.stationCode); } catch {}
+  let tafOverlay: TafRiskOverlay | null = null;
+  try { tafOverlay = await fetchTafRiskOverlay(city.stationCode); } catch {}
+  const postProcessor = loadStationPostProcessor(city);
+  const featureRows = postProcessor ? await buildCurrentForecastFeatureRows(city, forecastDays) : new Map();
+
   const results: Array<{ date: string; signals: BetSignal[]; arb: ReturnType<typeof detectArbOpportunity> }> = [];
 
   for (const date of dates) {
@@ -91,8 +106,40 @@ async function main() {
 
     // Model probabilities
     const marketCity = cityWithMarketBrackets(city, odds);
-    const temps      = ensembleMembers.filter(m => m.date === date).map(m => m.tempMaxC);
-    const modelProbs = computeBracketProbabilities(temps, marketCity, biasCorrection);
+    const baseTemps  = ensembleMembers.filter(m => m.date === date).map(m => m.tempMaxC);
+    const calibration = applyStationPostProcessorToTemps(city, baseTemps, featureRows.get(date) ?? {
+      date,
+      ecmwfMeanC: baseTemps.reduce((a, b) => a + b, 0) / Math.max(baseTemps.length, 1),
+      gfsMeanC: null,
+      aifsMeanC: null,
+      secondaryMeanC: null,
+      leadDays: 0,
+    }, postProcessor);
+    const metarFloor = applyLiveMetarTemperatureFloor(calibration.temps, marketCity, date, stationNowcast);
+    const temps      = metarFloor.temps;
+    const probRow = featureRows.get(date) ?? {
+      date,
+      ecmwfMeanC: baseTemps.reduce((a, b) => a + b, 0) / Math.max(baseTemps.length, 1),
+      gfsMeanC: null,
+      aifsMeanC: null,
+      secondaryMeanC: null,
+      leadDays: 0,
+    };
+    const probabilistic = computePostProcessedBracketProbabilities(marketCity, probRow, postProcessor);
+    const modelProbs = probabilistic.probs
+      ? (metarFloor.adjustment
+          ? applyObservedFloorToProbabilities(probabilistic.probs, marketCity, metarFloor.adjustment.observedMaxSoFarC)
+          : probabilistic.probs)
+      : computeBracketProbabilities(temps, marketCity, biasCorrection);
+    if (calibration.adjustment) {
+      console.log(`  Station post-process: shift ${calibration.adjustment.shiftC >= 0 ? '+' : ''}${calibration.adjustment.shiftC.toFixed(2)}°C (rmse ${calibration.adjustment.rmseC.toFixed(2)}°C)`);
+      if (calibration.adjustment.p10C !== undefined && calibration.adjustment.p90C !== undefined) {
+        console.log(`  Calibrated quantiles: p10=${calibration.adjustment.p10C.toFixed(1)}°C p50=${(calibration.adjustment.p50C ?? calibration.adjustment.calibratedMeanC).toFixed(1)}°C p90=${calibration.adjustment.p90C.toFixed(1)}°C lead=${calibration.adjustment.leadDays}d`);
+      }
+    }
+    if (metarFloor.adjustment) {
+      console.log(`  Observed max-so-far floor: ${metarFloor.adjustment.observedMaxSoFarC.toFixed(1)}°C from ${metarFloor.adjustment.observationCount} METAR(s) (${metarFloor.adjustment.method}, removed ${metarFloor.adjustment.discardedMemberCount})`);
+    }
 
     // Neg-risk arbitrage check: use executable ask-side prices, not Gamma
     // outcomePrices/midpoints. Midpoints can show fake buy-all arb.
@@ -103,9 +150,12 @@ async function main() {
     // EV + Kelly signals. Use executable YES asks for recommendations; the
     // Gamma outcome price can be a stale midpoint on thin markets.
     const signalPrices = Object.keys(yesAskPrices).length ? yesAskPrices : odds.probs;
-    const signals = applySingleMarketKellyRecommendation(
+    const signals = applyTafRiskToSignals(applySingleMarketKellyRecommendation(
       computeBetSignals(modelProbs, signalPrices, marketCity, bankrollUsd)
-    );
+    ), tafOverlay);
+    if (tafOverlay && tafOverlay.multiplier < 1) {
+      console.log(`  TAF risk overlay: ${tafOverlay.multiplier.toFixed(2)}x sizing (${tafOverlay.reasons.join('; ')})`);
+    }
 
     results.push({ date, signals, arb });
 

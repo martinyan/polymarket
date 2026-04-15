@@ -11,11 +11,15 @@
     "start": "node dist/index.js",
     "check": "tsx src/check.ts",
     "preview:once": "tsx src/preview.ts",
-    "test": "tsx --test src/activity.test.ts src/bot.test.ts src/strategy.test.ts src/weather/ev.test.ts",
+    "test": "node --import tsx --test src/activity.test.ts src/bot.test.ts src/strategy.test.ts src/weather/ev.test.ts src/weather/aviation.test.ts src/weather/postprocess.test.ts",
     "weather": "tsx src/weather/analyze.ts",
+    "weather:train": "node --import tsx src/weather/train_postprocess.ts",
     "weather:viz": "tsx src/weather/visualize.ts",
     "weather:bet": "tsx src/weather/bet.ts",
-    "weather:fwdtest": "tsx src/weather/forwardtest.ts"
+    "weather:fwdtest": "tsx src/weather/forwardtest.ts",
+    "weather:retro": "tsx src/weather/retro_backtest.ts",
+    "weather:snapshot": "tsx src/weather/snapshot.ts",
+    "weather:snapshot:analyze": "tsx src/weather/snapshot_analyze.ts"
   },
   "dependencies": {
     "@polymarket/clob-client": "^5.8.1",

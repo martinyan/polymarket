@@ -14,6 +14,15 @@ import { fetchMarketOdds, MarketOdds, cityWithMarketBrackets } from './polymarke
 import { computeBracketProbabilities, computeEdgeTable, BracketProbabilities } from './brackets';
 import { fetchMonthlyAnomaly } from './gistemp';
 import { parseCityArg, CITIES } from './cities';
+import { applyLiveMetarTemperatureFloor, fetchStationNowcast, fetchTafRiskOverlay, StationNowcast, TafRiskOverlay } from './aviation';
+import {
+  applyObservedFloorToProbabilities,
+  applyStationPostProcessorToTemps,
+  computePostProcessedBracketProbabilities,
+  loadStationPostProcessor,
+  validatePostProcessedBracketProbabilities,
+} from './postprocess';
+import { buildCurrentForecastFeatureRows } from './train_postprocess';
 
 // ---------------------------------------------------------------------------
 // CLI args
@@ -78,9 +87,32 @@ async function main() {
     } catch (e) { console.warn(`  ⚠ ${(e as Error).message}\n`); }
   }
 
+  let stationNowcast: StationNowcast | null = null;
+  let tafOverlay: TafRiskOverlay | null = null;
+  console.log('Fetching station METAR history…');
+  try {
+    stationNowcast = await fetchStationNowcast(city.stationCode);
+    if (stationNowcast.latest?.reportTime && stationNowcast.latest.tempC !== null) {
+      console.log(`  → ${stationNowcast.latest.stationCode} latest ${stationNowcast.latest.tempC.toFixed(1)}°C @ ${stationNowcast.latest.reportTime}; ${stationNowcast.observations.length} recent METAR(s)\n`);
+    } else {
+      console.log('  → no fresh METAR available\n');
+    }
+  } catch (e) {
+    console.warn(`  ⚠ ${(e as Error).message}\n`);
+  }
+  console.log('Fetching station TAF…');
+  try {
+    tafOverlay = await fetchTafRiskOverlay(city.stationCode);
+    if (tafOverlay) console.log(`  → ${tafOverlay.summary}\n`);
+  } catch (e) {
+    console.warn(`  ⚠ ${(e as Error).message}\n`);
+  }
+
   // Polymarket odds
   console.log('Fetching Polymarket live odds…');
   const dates = [...new Set(ecmwfMembers.map(m => m.date))].sort();
+  const postProcessor = loadStationPostProcessor(city);
+  const featureRows = postProcessor ? await buildCurrentForecastFeatureRows(city, forecastDays) : new Map();
   const oddsMap: Record<string, Partial<BracketProbabilities>> = {};
   const marketOddsMap: Record<string, MarketOdds> = {};
   const volumeMap: Record<string, number> = {};
@@ -103,11 +135,35 @@ async function main() {
   // Per-date output
   for (const date of dates) {
     const members  = ecmwfMembers.filter(m => m.date === date);
-    const temps    = members.map(m => m.tempMaxC);
+    const baseTemps = members.map(m => m.tempMaxC);
     const secondary = secondaryMembers.filter(m => m.date === date);
 
     const marketCity  = marketOddsMap[date] ? cityWithMarketBrackets(city, marketOddsMap[date]) : city;
-    const modelProbs  = computeBracketProbabilities(temps, marketCity, biasCorrection);
+    const calibration = applyStationPostProcessorToTemps(city, baseTemps, featureRows.get(date) ?? {
+      date,
+      ecmwfMeanC: mean(baseTemps),
+      gfsMeanC: null,
+      aifsMeanC: null,
+      secondaryMeanC: null,
+      leadDays: 0,
+    }, postProcessor);
+    const metarFloor  = applyLiveMetarTemperatureFloor(calibration.temps, marketCity, date, stationNowcast);
+    const temps       = metarFloor.temps;
+    const probRow = featureRows.get(date) ?? {
+      date,
+      ecmwfMeanC: mean(baseTemps),
+      gfsMeanC: null,
+      aifsMeanC: null,
+      secondaryMeanC: null,
+      leadDays: 0,
+    };
+    const probabilistic = computePostProcessedBracketProbabilities(marketCity, probRow, postProcessor);
+    const useProbabilistic = probabilistic.probs && validatePostProcessedBracketProbabilities(probabilistic.probs, marketCity, temps);
+    const modelProbs  = useProbabilistic
+      ? (metarFloor.adjustment
+          ? applyObservedFloorToProbabilities(probabilistic.probs, marketCity, metarFloor.adjustment.observedMaxSoFarC)
+          : probabilistic.probs)
+      : computeBracketProbabilities(temps, marketCity, biasCorrection);
     const marketProbs = oddsMap[date] ?? {};
     const edgeTable   = computeEdgeTable(modelProbs, marketProbs, marketCity);
 
@@ -119,6 +175,18 @@ async function main() {
     console.log(`─────────────────────────────────────────────`);
     console.log(`${date}  |  ${city.name}`);
     console.log(`ECMWF: mean=${eMean.toFixed(1)}°C  std=±${eStd.toFixed(1)}°C  p10=${p10.toFixed(1)}  p90=${p90.toFixed(1)}`);
+    if (calibration.adjustment) {
+      console.log(`Station post-process: shift ${calibration.adjustment.shiftC >= 0 ? '+' : ''}${calibration.adjustment.shiftC.toFixed(2)}°C  (rmse ${calibration.adjustment.rmseC.toFixed(2)}°C, n=${calibration.adjustment.sampleCount})`);
+      if (calibration.adjustment.p10C !== undefined && calibration.adjustment.p90C !== undefined) {
+        console.log(`Calibrated quantiles: p10=${calibration.adjustment.p10C.toFixed(1)}°C  p50=${(calibration.adjustment.p50C ?? calibration.adjustment.calibratedMeanC).toFixed(1)}°C  p90=${calibration.adjustment.p90C.toFixed(1)}°C  lead=${calibration.adjustment.leadDays}d`);
+      }
+    }
+    if (metarFloor.adjustment) {
+      console.log(`Observed max-so-far floor: ${metarFloor.adjustment.observedMaxSoFarC.toFixed(1)}°C from ${metarFloor.adjustment.observationCount} METAR(s)  (${metarFloor.adjustment.method}, removed ${metarFloor.adjustment.discardedMemberCount})`);
+    }
+    if (tafOverlay && tafOverlay.multiplier < 1) {
+      console.log(`TAF risk overlay: ${tafOverlay.multiplier.toFixed(2)}x sizing  (${tafOverlay.reasons.join('; ')})`);
+    }
 
     if (secondary.length === 1) {
       console.log(`${city.id === 'seoul' ? 'KMA LDPS' : 'Met Office'}: ${secondary[0].tempMaxC.toFixed(1)}°C`);

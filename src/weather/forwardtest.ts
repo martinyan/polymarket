@@ -20,9 +20,25 @@ import { createTradingClient } from '../polymarket';
 import { fetchEcmwfEnsemble, fetchSecondaryForecast, EnsembleMember } from './ensemble';
 import { fetchMarketOdds, cityWithMarketBrackets, BracketMarket } from './polymarket_odds';
 import { computeBracketProbabilities, titleToBracket } from './brackets';
-import { applySingleMarketKellyRecommendation, computeBetSignals, BetSignal } from './ev';
-import { CITIES, CityConfig, parseCityArg } from './cities';
+import {
+  applySingleMarketKellyRecommendation,
+  computeBetSignals,
+  BetSignal,
+  expectedLogGrowthForSingle,
+  findBestTwoBracketBasket,
+} from './ev';
+import { CITIES, CityConfig, FORWARD_TEST_CITY_IDS, TARGET_WEATHER_CITY_COUNT } from './cities';
 import { fetchJson } from '../http';
+import { applyLiveMetarTemperatureFloor, applyTafRiskToSignals, fetchStationNowcast, fetchTafRiskOverlay, StationNowcast, TafRiskOverlay } from './aviation';
+import {
+  applyObservedFloorToProbabilities,
+  applyStationPostProcessorToTemps,
+  computePostProcessedBracketProbabilities,
+  loadStationPostProcessor,
+  validatePostProcessedBracketProbabilities,
+} from './postprocess';
+import { buildCurrentForecastFeatureRows } from './train_postprocess';
+import { cityDayEndUtcMs, tradeWindowOpenUtcMs } from './time';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -49,6 +65,25 @@ export type LogEntry = {
   notes:           string;
 };
 
+function parseBasketLegs(notes: string): Array<{ bracket: string; price: number; stakeUsd: number }> {
+  const match = notes.match(/basket_legs=([^;]+)/);
+  if (!match) return [];
+  return match[1]
+    .split('|')
+    .map(part => {
+      const legMatch = part.match(/^([^@]+)@([0-9.]+)\@\$(.+)$/);
+      if (!legMatch) return null;
+      return {
+        bracket: legMatch[1] ?? '',
+        price: parseFloat(legMatch[2] ?? '0'),
+        stakeUsd: parseFloat(legMatch[3] ?? '0'),
+      };
+    })
+    .filter((leg): leg is { bracket: string; price: number; stakeUsd: number } =>
+      !!leg && !!leg.bracket && Number.isFinite(leg.price) && Number.isFinite(leg.stakeUsd)
+    );
+}
+
 const CSV_PATH    = 'data/forward_test_log.csv';
 const GAMMA_BASE  = 'https://gamma-api.polymarket.com';
 const STARTING_BANKROLL_USD = 1000;
@@ -56,33 +91,9 @@ const STARTING_BANKROLL_USD = 1000;
 // How many hours before a day ends (in local city time) we are allowed to enter a bet.
 const TRADE_WINDOW_HOURS = 8;
 
-// UTC offsets (hours) for each city timezone, accurate for April (DST already applied).
-// Seoul/Tokyo/Shanghai have no DST. London = BST (UTC+1). Tel Aviv = IDT (UTC+3).
-const TZ_OFFSET_HOURS: Record<string, number> = {
-  'Asia/Seoul':     9,
-  'Asia/Tokyo':     9,
-  'Asia/Shanghai':  8,
-  'Asia/Jerusalem': 3,   // Israel Daylight Time, April
-  'Europe/London':  1,   // British Summer Time, April
-};
-
-/**
- * Returns the UTC millisecond timestamp when `marketDate` ends (local midnight)
- * in the city's timezone — i.e. when the daily high is fully determined.
- *
- * Example: Seoul Apr 6  → midnight Apr 7 KST = Apr 6 15:00 UTC
- *          London Apr 6 → midnight Apr 7 BST = Apr 6 23:00 UTC
- */
-function cityDayEndUtcMs(marketDate: string, timezone: string): number {
-  const [y, m, d]  = marketDate.split('-').map(Number);
-  const offsetHours = TZ_OFFSET_HOURS[timezone] ?? 0;
-  // Midnight start of next day in local time = UTC midnight of next day minus offset
-  return Date.UTC(y, m - 1, d + 1, 0, 0, 0) - offsetHours * 3_600_000;
-}
-
 /** Return ISO string showing when the trade window opens for a city+date. */
 function windowOpenStr(marketDate: string, timezone: string): string {
-  const openMs = cityDayEndUtcMs(marketDate, timezone) - TRADE_WINDOW_HOURS * 3_600_000;
+  const openMs = tradeWindowOpenUtcMs(marketDate, timezone, TRADE_WINDOW_HOURS);
   return new Date(openMs).toISOString();
 }
 
@@ -238,10 +249,16 @@ async function runLogger(cityIds: string[]): Promise<number> {
 
     const dates: string[] = [...new Set(members.map(m => m.date))].sort();
     const nowMs = Date.now();
+    let stationNowcast: StationNowcast | null = null;
+    try { stationNowcast = await fetchStationNowcast(city.stationCode); } catch {}
+    let tafOverlay: TafRiskOverlay | null = null;
+    try { tafOverlay = await fetchTafRiskOverlay(city.stationCode); } catch {}
+    const postProcessor = loadStationPostProcessor(city);
+    const featureRows = postProcessor ? await buildCurrentForecastFeatureRows(city, 7) : new Map();
 
     for (const date of dates) {
       const dayEndMs      = cityDayEndUtcMs(date, city.timezone);
-      const windowStartMs = dayEndMs - TRADE_WINDOW_HOURS * 3_600_000;
+      const windowStartMs = tradeWindowOpenUtcMs(date, city.timezone, TRADE_WINDOW_HOURS);
 
       if (nowMs < windowStartMs) {
         // Too early — window not open yet; log when it opens
@@ -271,15 +288,38 @@ async function runLogger(cityIds: string[]): Promise<number> {
       }
 
       const marketCity = cityWithMarketBrackets(city, odds);
-      const temps      = members.filter(m => m.date === date).map(m => m.tempMaxC);
-      const modelProbs = computeBracketProbabilities(temps, marketCity, 0);
+      const baseTemps  = members.filter(m => m.date === date).map(m => m.tempMaxC);
+      const calibration = applyStationPostProcessorToTemps(city, baseTemps, featureRows.get(date) ?? {
+        date,
+        ecmwfMeanC: baseTemps.reduce((a, b) => a + b, 0) / Math.max(baseTemps.length, 1),
+        gfsMeanC: null,
+        aifsMeanC: null,
+        secondaryMeanC: null,
+        leadDays: 0,
+      }, postProcessor);
+      const metarFloor = applyLiveMetarTemperatureFloor(calibration.temps, marketCity, date, stationNowcast);
+      const temps      = metarFloor.temps;
+      const probRow = featureRows.get(date) ?? {
+        date,
+        ecmwfMeanC: baseTemps.reduce((a, b) => a + b, 0) / Math.max(baseTemps.length, 1),
+        gfsMeanC: null,
+        aifsMeanC: null,
+        secondaryMeanC: null,
+        leadDays: 0,
+      };
+      const probabilistic = computePostProcessedBracketProbabilities(marketCity, probRow, postProcessor);
+      const useProbabilistic = probabilistic.probs && validatePostProcessedBracketProbabilities(probabilistic.probs, marketCity, temps);
+      const modelProbs = useProbabilistic
+        ? (metarFloor.adjustment
+            ? applyObservedFloorToProbabilities(probabilistic.probs, marketCity, metarFloor.adjustment.observedMaxSoFarC)
+            : probabilistic.probs)
+        : computeBracketProbabilities(temps, marketCity, 0);
       const yesAskPrices = Object.fromEntries(odds.bracketMarkets.map(b => [b.bracket, b.yesAsk]));
       const signalPrices = Object.keys(yesAskPrices).length ? yesAskPrices : odds.probs;
       const rawSignals = computeBetSignals(modelProbs, signalPrices, marketCity, availableBankroll);
-      const totalAboveThreshold = rawSignals.filter(s => s.action === 'BUY').length;
-      const signals    = applySingleMarketKellyRecommendation(
-        rawSignals
-      );
+      const tafAdjustedSignals = applyTafRiskToSignals(rawSignals, tafOverlay);
+      const totalAboveThreshold = tafAdjustedSignals.filter(s => s.action === 'BUY').length;
+      const signals = applySingleMarketKellyRecommendation(tafAdjustedSignals);
       const buySignals = signals.filter(s => s.action === 'BUY');
 
       // --- Correlated-bet guard ---
@@ -287,6 +327,15 @@ async function runLogger(cityIds: string[]): Promise<number> {
       // Portfolio Kelly collapses to: bet only the single highest-conviction bracket.
       // Betting multiple brackets on the same event re-exposes to the same risk multiple times.
       const best = buySignals.sort((a, b) => b.kellyFraction - a.kellyFraction)[0];
+      const bestBasket = best
+        ? findBestTwoBracketBasket(tafAdjustedSignals, availableBankroll, best.suggestedUsd)
+        : null;
+      const useBasket = !!(
+        best &&
+        bestBasket &&
+        bestBasket.expectedLogGrowth > expectedLogGrowthForSingle(best, availableBankroll) + 1e-9 &&
+        bestBasket.profitProbability > best.modelProb + 1e-9
+      );
 
       if (!best) {
         // No qualifying BUY signal — show the best candidate so we know why it was skipped
@@ -307,6 +356,50 @@ async function runLogger(cityIds: string[]): Promise<number> {
       const note = totalAboveThreshold > 1
         ? `best of ${totalAboveThreshold} qualifying brackets (highest Kelly)`
         : '';
+
+      if (useBasket && bestBasket) {
+        const [legA, legB] = bestBasket.brackets.map(bracket => tafAdjustedSignals.find(signal => signal.bracket === bracket)).filter((signal): signal is BetSignal => !!signal);
+        if (legA && legB) {
+          entries.push({
+            logged_at:      captureTime.toISOString(),
+            city:           city.name,
+            market_date:    date,
+            bracket:        `${bestBasket.brackets[0]}|${bestBasket.brackets[1]}`,
+            bracket_label:  `${bestBasket.labels[0]} + ${bestBasket.labels[1]} basket`,
+            model_prob:     bestBasket.profitProbability,
+            market_price:   bestBasket.totalStakeUsd > 0 ? (bestBasket.stakeUsd[0] * bestBasket.marketPrices[0] + bestBasket.stakeUsd[1] * bestBasket.marketPrices[1]) / bestBasket.totalStakeUsd : 0,
+            edge:           bestBasket.profitProbability - best.modelProb,
+            ev_per_dollar:  bestBasket.evPerDollar,
+            kelly_pct:      bestBasket.totalStakeFraction,
+            suggested_usd:  bestBasket.totalStakeUsd,
+            order_status:   'preview-basket',
+            order_id:       '',
+            resolved:       false,
+            actual_bracket: '',
+            pnl:            0,
+            notes:          [
+              note,
+              `basket_legs=${bestBasket.brackets[0]}@${bestBasket.marketPrices[0].toFixed(4)}@$${bestBasket.stakeUsd[0].toFixed(2)}|${bestBasket.brackets[1]}@${bestBasket.marketPrices[1].toFixed(4)}@$${bestBasket.stakeUsd[1].toFixed(2)}`,
+              `basket_log_growth=${bestBasket.expectedLogGrowth.toFixed(8)}`,
+              `basket_profit_prob=${(bestBasket.profitProbability * 100).toFixed(2)}%`,
+              `basket_outcomes=$${bestBasket.outcomeProfitUsd[0].toFixed(2)}/$${bestBasket.outcomeProfitUsd[1].toFixed(2)}`,
+              `single_baseline=${best.bracket}@${best.marketPrice.toFixed(4)} log=${expectedLogGrowthForSingle(best, availableBankroll).toFixed(8)}`,
+              calibration.adjustment ? `postprocess_shift=${calibration.adjustment.shiftC.toFixed(2)}C` : '',
+              calibration.adjustment?.p10C !== undefined && calibration.adjustment?.p90C !== undefined
+                ? `postprocess_q=${calibration.adjustment.p10C.toFixed(1)}/${(calibration.adjustment.p50C ?? calibration.adjustment.calibratedMeanC).toFixed(1)}/${calibration.adjustment.p90C.toFixed(1)}`
+                : '',
+              metarFloor.adjustment ? `aviation_floor=${metarFloor.adjustment.observedMaxSoFarC.toFixed(1)}C/${metarFloor.adjustment.method}/${metarFloor.adjustment.observationCount}obs` : '',
+              tafOverlay && tafOverlay.multiplier < 1 ? `taf_overlay=${tafOverlay.multiplier.toFixed(2)}x` : '',
+              `window_open=${new Date(windowStartMs).toISOString()}`,
+              `captured_in_8h_window`,
+              `bankroll=${availableBankroll.toFixed(2)}`,
+            ].filter(Boolean).join('; '),
+          });
+          console.log(`    + ${city.name} ${date} BASKET ${bestBasket.labels[0]} + ${bestBasket.labels[1]}  winP=${(bestBasket.profitProbability*100).toFixed(1)}%  EV=${(bestBasket.evPerDollar*100).toFixed(1)}¢  size=$${bestBasket.totalStakeUsd.toFixed(0)}  [preview-basket]  beats ${best.label}`);
+          added++;
+          continue;
+        }
+      }
 
       // Place the order (live or preview)
       const bm = odds.bracketMarkets.find(b => b.bracket === best.bracket);
@@ -333,6 +426,12 @@ async function runLogger(cityIds: string[]): Promise<number> {
         pnl:            0,
         notes:          [
           note,
+          calibration.adjustment ? `postprocess_shift=${calibration.adjustment.shiftC.toFixed(2)}C` : '',
+          calibration.adjustment?.p10C !== undefined && calibration.adjustment?.p90C !== undefined
+            ? `postprocess_q=${calibration.adjustment.p10C.toFixed(1)}/${(calibration.adjustment.p50C ?? calibration.adjustment.calibratedMeanC).toFixed(1)}/${calibration.adjustment.p90C.toFixed(1)}`
+            : '',
+          metarFloor.adjustment ? `aviation_floor=${metarFloor.adjustment.observedMaxSoFarC.toFixed(1)}C/${metarFloor.adjustment.method}/${metarFloor.adjustment.observationCount}obs` : '',
+          tafOverlay && tafOverlay.multiplier < 1 ? `taf_overlay=${tafOverlay.multiplier.toFixed(2)}x` : '',
           `window_open=${new Date(windowStartMs).toISOString()}`,
           `captured_in_8h_window`,
           `bankroll=${availableBankroll.toFixed(2)}`,
@@ -413,6 +512,21 @@ async function runResolver(): Promise<number> {
       entry.resolved       = true;
       entry.actual_bracket = actualBracket;
 
+      const basketLegs = parseBasketLegs(entry.notes);
+      if (basketLegs.length === 2) {
+        const winner = basketLegs.find(leg => leg.bracket === actualBracket);
+        if (winner) {
+          const totalStake = basketLegs.reduce((sum, leg) => sum + leg.stakeUsd, 0);
+          entry.pnl = winner.stakeUsd * (1 / winner.price - 1) - (totalStake - winner.stakeUsd);
+          entry.notes = `WIN basket`;
+        } else {
+          entry.pnl = -basketLegs.reduce((sum, leg) => sum + leg.stakeUsd, 0);
+          entry.notes = `LOSS basket`;
+        }
+        resolved++;
+        continue;
+      }
+
       const won = entry.bracket === actualBracket;
       if (won) {
         if (entry.market_price <= 0) {
@@ -453,6 +567,7 @@ function runReport(): void {
   console.log(' FORWARD TEST REPORT');
   console.log(`══════════════════════════════════════════════════════`);
   console.log(` Period:     ${entries[0]?.logged_at.slice(0,10) ?? '—'} → ${new Date().toISOString().slice(0,10)}`);
+  console.log(` Universe:   ${TARGET_WEATHER_CITY_COUNT} tracked cities in the expansion plan`);
   console.log(` Open:       ${open.length} signals pending resolution`);
   console.log(` Closed:     ${closed.length} (${wins.length} wins, ${losses.length} losses)`);
   console.log(` Win rate:   ${closed.length ? (wins.length/closed.length*100).toFixed(1)+'%' : '—'}`);
@@ -514,7 +629,7 @@ const mode   = ['log','resolve','report','all'].find(m => args.includes(m)) ?? '
 
 const cityIdx = args.indexOf('--city');
 const cityArg = cityIdx !== -1 ? args[cityIdx + 1] : 'all';
-const cityIds = cityArg === 'all' ? Object.keys(CITIES) : [cityArg];
+const cityIds = cityArg === 'all' ? FORWARD_TEST_CITY_IDS : [cityArg];
 
 async function main() {
   console.log(`\n=== Forward Test [${mode.toUpperCase()}] — ${new Date().toISOString()} ===\n`);

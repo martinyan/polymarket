@@ -10,8 +10,19 @@ import { fetchEcmwfEnsemble, fetchSecondaryForecast, EnsembleMember } from './en
 import { fetchMarketOdds, cityWithMarketBrackets, MarketOdds } from './polymarket_odds';
 import { computeBracketProbabilities, computeEdgeTable, buildBrackets, bracketLabel, BracketProbabilities } from './brackets';
 import { fetchMonthlyAnomaly } from './gistemp';
-import { CITIES, CityConfig } from './cities';
+import { CITIES, CityConfig, PORTAL_CITY_IDS, TARGET_WEATHER_CITY_COUNT } from './cities';
 import { applySingleMarketKellyRecommendation, computeBetSignals, detectArbOpportunity, BetSignal, ArbSignal } from './ev';
+import { applyLiveMetarTemperatureFloor, applyTafRiskToSignals, fetchStationNowcast, fetchTafRiskOverlay, LiveTemperatureFloorAdjustment, StationNowcast, TafRiskOverlay } from './aviation';
+import {
+  applyObservedFloorToProbabilities,
+  applyStationPostProcessorToTemps,
+  computePostProcessedBracketProbabilities,
+  loadStationPostProcessor,
+  PostProcessAdjustment,
+  validatePostProcessedBracketProbabilities,
+} from './postprocess';
+import { buildCurrentForecastFeatureRows } from './train_postprocess';
+import { cityDayEndUtcMs, tradeWindowOpenUtcMs } from './time';
 import { ENV as _ENV } from '../config';
 const IS_LIVE_NOTE = _ENV.PREVIEW_MODE ? '🟡 PREVIEW MODE — no real orders placed' : '🔴 LIVE MODE — real orders placed';
 
@@ -19,18 +30,9 @@ const IS_LIVE_NOTE = _ENV.PREVIEW_MODE ? '🟡 PREVIEW MODE — no real orders p
 // Trade window helpers (mirrors forwardtest.ts logic)
 // ---------------------------------------------------------------------------
 const TRADE_WINDOW_HOURS = 8;
-
-const TZ_OFFSET_HOURS: Record<string, number> = {
-  'Asia/Seoul': 9, 'Asia/Tokyo': 9, 'Asia/Shanghai': 8,
-  'Asia/Jerusalem': 3, 'Europe/London': 1,
-};
-function cityDayEndUtcMs(date: string, tz: string): number {
-  const [y, m, d] = date.split('-').map(Number);
-  return Date.UTC(y, m - 1, d + 1, 0, 0, 0) - (TZ_OFFSET_HOURS[tz] ?? 0) * 3_600_000;
-}
 function tradeWindowStatus(date: string, tz: string): { open: boolean; opensAt: string; closesAt: string } {
   const dayEndMs   = cityDayEndUtcMs(date, tz);
-  const openMs     = dayEndMs - TRADE_WINDOW_HOURS * 3_600_000;
+  const openMs     = tradeWindowOpenUtcMs(date, tz, TRADE_WINDOW_HOURS);
   const now        = Date.now();
   const fmt = (ms: number) => new Date(ms).toISOString().slice(11, 16) + ' UTC';
   return { open: now >= openMs && now < dayEndMs, opensAt: fmt(openMs), closesAt: fmt(dayEndMs) };
@@ -47,7 +49,7 @@ let outPath        = 'data/weather_analysis.html';
 
 const cityIdx = args.indexOf('--city');
 const cityArg = cityIdx !== -1 ? args[cityIdx + 1] : 'all';
-const cityIds = cityArg === 'all' ? Object.keys(CITIES) : [cityArg];
+const cityIds = cityArg === 'all' ? PORTAL_CITY_IDS : [cityArg];
 
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--days'     && args[i+1]) forecastDays   = parseInt(args[++i], 10);
@@ -72,6 +74,9 @@ type DateSnapshot = {
   volume: number; liquidity: number;
   signals: BetSignal[];
   arb: ArbSignal | null;
+  aviation: LiveTemperatureFloorAdjustment | null;
+  taf: TafRiskOverlay | null;
+  postprocess: PostProcessAdjustment | null;
 };
 
 type CityResult = {
@@ -80,6 +85,53 @@ type CityResult = {
   snapshots: DateSnapshot[];
 };
 
+type PersistedSnapshotDay = {
+  date: string;
+  volume: number;
+  liquidity: number;
+  marketProbs: Record<string, number>;
+  signals: Array<{
+    bracket: string;
+    label: string;
+    modelProb: number;
+    marketPrice: number;
+    edge: number;
+    evPerDollar: number;
+    kellyFraction: number;
+    suggestedUsd: number;
+    action: string;
+    reason?: string;
+  }>;
+};
+
+type PersistedSnapshotRun = {
+  generatedAt: string;
+  cities: Array<{
+    cityId: string;
+    days: PersistedSnapshotDay[];
+  }>;
+};
+
+function loadLatestSnapshotIndex(): Map<string, PersistedSnapshotDay> {
+  const snapshotPath = 'data/weather_snapshot_latest.json';
+  if (!existsSync(snapshotPath)) return new Map();
+  try {
+    const raw = readFileSync(snapshotPath, 'utf8');
+    const parsed = JSON.parse(raw) as PersistedSnapshotRun;
+    const index = new Map<string, PersistedSnapshotDay>();
+    for (const city of parsed.cities ?? []) {
+      for (const day of city.days ?? []) {
+        index.set(`${city.cityId}:${day.date}`, day);
+      }
+    }
+    return index;
+  } catch {
+    return new Map();
+  }
+}
+
+const latestSnapshotIndex = loadLatestSnapshotIndex();
+
 // ---------------------------------------------------------------------------
 // Data fetching
 // ---------------------------------------------------------------------------
@@ -87,6 +139,13 @@ async function fetchCityData(city: CityConfig): Promise<CityResult> {
   process.stdout.write(`  [${city.name}] ECMWF ensemble… `);
   const ecmwfMembers = await fetchEcmwfEnsemble(city, forecastDays);
   process.stdout.write(`${ecmwfMembers.length} member-days\n`);
+
+  let stationNowcast: StationNowcast | null = null;
+  try { stationNowcast = await fetchStationNowcast(city.stationCode); } catch {}
+  let tafOverlay: TafRiskOverlay | null = null;
+  try { tafOverlay = await fetchTafRiskOverlay(city.stationCode); } catch {}
+  const postProcessor = loadStationPostProcessor(city);
+  const featureRows = postProcessor ? await buildCurrentForecastFeatureRows(city, forecastDays) : new Map();
 
   let secondaryMembers: EnsembleMember[] = [];
   const secondaryModelLabels: Record<string, string> = {
@@ -107,23 +166,66 @@ async function fetchCityData(city: CityConfig): Promise<CityResult> {
     process.stdout.write(`  [${city.name}] ${date} odds… `);
     const dayEcmwf = ecmwfMembers.filter(m => m.date === date);
     const daySec   = secondaryMembers.filter(m => m.date === date);
-    const temps    = dayEcmwf.map(m => m.tempMaxC);
+    const baseTemps = dayEcmwf.map(m => m.tempMaxC);
     const secTemps = daySec.map(m => m.tempMaxC);
 
     let odds: MarketOdds | null = null;
     try { odds = await fetchMarketOdds(city, date); } catch {}
 
     const marketCity  = odds ? cityWithMarketBrackets(city, odds) : city;
-    const modelProbs  = computeBracketProbabilities(temps, marketCity, biasCorrection);
+    const calibration = applyStationPostProcessorToTemps(city, baseTemps, featureRows.get(date) ?? {
+      date,
+      ecmwfMeanC: mean(baseTemps),
+      gfsMeanC: null,
+      aifsMeanC: null,
+      secondaryMeanC: null,
+      leadDays: 0,
+    }, postProcessor);
+    const metarFloor  = applyLiveMetarTemperatureFloor(calibration.temps, marketCity, date, stationNowcast);
+    const temps       = metarFloor.temps;
+    const probRow = featureRows.get(date) ?? {
+      date,
+      ecmwfMeanC: mean(baseTemps),
+      gfsMeanC: null,
+      aifsMeanC: null,
+      secondaryMeanC: null,
+      leadDays: 0,
+    };
+    const probabilistic = computePostProcessedBracketProbabilities(marketCity, probRow, postProcessor);
+    const useProbabilistic = probabilistic.probs && validatePostProcessedBracketProbabilities(probabilistic.probs, marketCity, temps);
+    const modelProbs  = useProbabilistic
+      ? (metarFloor.adjustment
+          ? applyObservedFloorToProbabilities(probabilistic.probs, marketCity, metarFloor.adjustment.observedMaxSoFarC)
+          : probabilistic.probs)
+      : computeBracketProbabilities(temps, marketCity, biasCorrection);
+    const snapshotDay = latestSnapshotIndex.get(`${city.id}:${date}`);
     const rawPrices   = Object.fromEntries((odds?.bracketMarkets ?? []).map(b => [b.bracket, b.yesAsk]));
     const noAskPrices = Object.fromEntries((odds?.bracketMarkets ?? []).map(b => [b.bracket, b.noAsk]));
-    const marketProbs = Object.keys(rawPrices).length ? rawPrices : (odds?.probs ?? {});
-    const volume      = odds?.volume ?? 0;
-    const liquidity   = odds?.liquidity ?? 0;
+    const liveMarketProbs = Object.keys(rawPrices).length ? rawPrices : (odds?.probs ?? {});
+    const marketProbs = Object.keys(snapshotDay?.marketProbs ?? {}).length
+      ? snapshotDay!.marketProbs
+      : liveMarketProbs;
+    const volume      = snapshotDay?.volume ?? odds?.volume ?? 0;
+    const liquidity   = snapshotDay?.liquidity ?? odds?.liquidity ?? 0;
 
-    const signals = applySingleMarketKellyRecommendation(
+    const computedSignals = applyTafRiskToSignals(applySingleMarketKellyRecommendation(
       computeBetSignals(modelProbs, marketProbs, marketCity, bankrollUsd)
-    );
+    ), tafOverlay);
+    const signals: BetSignal[] = (snapshotDay?.signals ?? []).length
+      ? snapshotDay!.signals.map(signal => ({
+          bracket: signal.bracket,
+          label: signal.label,
+          modelProb: signal.modelProb,
+          marketPrice: signal.marketPrice,
+          edge: signal.edge,
+          evPerDollar: signal.evPerDollar,
+          kellyFraction: signal.kellyFraction,
+          scaledKelly: signal.kellyFraction * 0.25,
+          suggestedUsd: signal.suggestedUsd,
+          action: signal.action as BetSignal['action'],
+          reason: signal.reason,
+        }))
+      : computedSignals;
     const arb     = detectArbOpportunity(rawPrices, marketCity, 0.01, 0.02, noAskPrices);
 
     const hasMkt = Object.keys(marketProbs).length > 0;
@@ -138,7 +240,7 @@ async function fetchCityData(city: CityConfig): Promise<CityResult> {
       secondaryMean: secTemps.length ? mean(secTemps) : null,
       secondaryStd:  secTemps.length > 1 ? stdDev(secTemps) : null,
       marketCity, modelProbs, marketProbs, rawPrices,
-      members: temps, volume, liquidity, signals, arb,
+      members: temps, volume, liquidity, signals, arb, aviation: metarFloor.adjustment, taf: tafOverlay, postprocess: calibration.adjustment,
     });
   }
 
@@ -170,6 +272,9 @@ function buildHtml(results: CityResult[]): string {
   const generatedAt = new Date().toUTCString();
   const totalBuys   = results.flatMap(r => r.snapshots.flatMap(s => s.signals.filter(x => x.action === 'BUY'))).length;
   const totalArbs   = results.flatMap(r => r.snapshots.filter(s => s.arb)).length;
+  const coreCount   = results.filter(r => r.city.launchPhase === 'core').length;
+  const wave1Count  = results.filter(r => r.city.launchPhase === 'wave_1').length;
+  const wave2Count  = results.filter(r => r.city.launchPhase === 'wave_2').length;
 
   const tabBtns   = results.map((r, i) => `
     <button class="tab-btn${i===0?' active':''}" onclick="switchTab('${r.city.id}')" id="tab-${r.city.id}">
@@ -211,10 +316,17 @@ h1{font-size:1.4rem;font-weight:700;color:#f8fafc;margin-bottom:4px}
 .tab-btn.active{background:#1d4ed8;border-color:#3b82f6;color:#fff}
 .tab-sub{font-size:.72rem;opacity:.75}
 .tab-panel{display:none}.tab-panel.active{display:block}
+.expansion{background:#111827;border:1px solid #1f2937;border-radius:12px;padding:16px 18px;margin-bottom:20px}
+.expansion-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-top:12px}
+.expansion-card{background:#0f172a;border:1px solid #334155;border-radius:10px;padding:12px 14px}
+.expansion-label{font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:6px}
+.expansion-value{font-size:1.15rem;font-weight:700;color:#f8fafc}
+.expansion-note{font-size:.78rem;color:#94a3b8;line-height:1.45}
 /* city header */
 .city-hdr{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start;margin-bottom:18px}
 .city-title{font-size:1.1rem;font-weight:700;color:#f8fafc}
 .city-meta{font-size:.78rem;color:#64748b}
+.phase{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;background:#172554;color:#bfdbfe;border:1px solid #1d4ed8}
 .anom{display:inline-flex;align-items:center;gap:6px;padding:3px 11px;border-radius:20px;font-size:.78rem;font-weight:600}
 .anom-warm{background:#450a0a;color:#fca5a5}.anom-cool{background:#0c2340;color:#93c5fd}
 a.stn{font-size:.75rem;color:#3b82f6;text-decoration:none}
@@ -266,6 +378,17 @@ tr:last-child td{border-bottom:none}
   <span class="badge-sum">✅ ${totalBuys} BUY signal${totalBuys!==1?'s':''}</span>
   ${totalArbs > 0 ? `<span class="badge-arb">🔺 ${totalArbs} ARB opportunity${totalArbs!==1?'s':''}</span>` : ''}
   <span style="color:#475569;font-size:.75rem">🔵 Model = ECMWF IFS 51-member &nbsp;|&nbsp; 🟠 Market = Polymarket &nbsp;|&nbsp; Kelly scale = 25%</span>
+</div>
+
+<div class="expansion">
+  <div class="city-title" style="margin-bottom:4px">20-city expansion now live in the portal</div>
+  <div class="expansion-note">The weather universe has been expanded from the original 5-city core to a tracked 20-city Celsius market set. The portal, audit tab, and forward-test logger now share the same rollout universe and ordering.</div>
+  <div class="expansion-grid">
+    <div class="expansion-card"><div class="expansion-label">Tracked cities</div><div class="expansion-value">${results.length} / ${TARGET_WEATHER_CITY_COUNT}</div></div>
+    <div class="expansion-card"><div class="expansion-label">Core</div><div class="expansion-value">${coreCount}</div><div class="expansion-note">Original high-confidence base markets.</div></div>
+    <div class="expansion-card"><div class="expansion-label">Wave 1</div><div class="expansion-value">${wave1Count}</div><div class="expansion-note">First expansion batch to widen geography quickly.</div></div>
+    <div class="expansion-card"><div class="expansion-label">Wave 2</div><div class="expansion-value">${wave2Count}</div><div class="expansion-note">Additional Celsius markets now included in monitoring and testing.</div></div>
+  </div>
 </div>
 
 <div class="tabs">${tabBtns}${auditTabBtn}</div>
@@ -328,6 +451,11 @@ function cityVolLabel(r: CityResult): string {
 function buildCityPanel(r: CityResult): string {
   const { city, anomaly, snapshots } = r;
   const aSign = anomaly && anomaly.anomalyC >= 0 ? '+' : '';
+  const phaseLabel = city.launchPhase === 'core'
+    ? 'Core'
+    : city.launchPhase === 'wave_1'
+      ? 'Wave 1'
+      : 'Wave 2';
   const anomHtml = anomaly
     ? `<span class="anom ${anomaly.anomalyC>=0?'anom-warm':'anom-cool'}">
          ${anomaly.anomalyC>=0?'🌡':'❄️'} ${anomaly.year}-${String(anomaly.month).padStart(2,'0')} anomaly: ${aSign}${anomaly.anomalyC.toFixed(2)}°C vs 1991–2020
@@ -335,10 +463,11 @@ function buildCityPanel(r: CityResult): string {
 
   return `<div class="city-hdr">
     <div>
-      <div class="city-title">${city.name}</div>
+      <div class="city-title">${city.name} <span class="phase">${phaseLabel}</span></div>
       <div class="city-meta">
         Resolution: <a class="stn" href="${city.wundergroundUrl}" target="_blank">${city.wundergroundUrl.split('/').pop()}</a>
-        &nbsp;·&nbsp; ${city.lat}°N ${city.lon}°E
+        &nbsp;·&nbsp; ${city.lat.toFixed(4)}, ${city.lon.toFixed(4)}
+        &nbsp;·&nbsp; ${city.note}
       </div>
     </div>
     ${anomHtml}
@@ -360,12 +489,21 @@ function buildCard(s: DateSnapshot, city: CityConfig): string {
   const volStr    = s.volume ? `$${Math.round(s.volume/1000)}K vol · $${Math.round(s.liquidity/1000)}K liq` : 'no market';
   const win       = tradeWindowStatus(s.date, city.timezone);
   const dayEndMs  = cityDayEndUtcMs(s.date, city.timezone);
-  const openMs    = dayEndMs - TRADE_WINDOW_HOURS * 3_600_000;
+  const openMs    = tradeWindowOpenUtcMs(s.date, city.timezone, TRADE_WINDOW_HOURS);
   // Embed UTC epoch timestamps as data attrs — client JS updates every second
   const winBadge  = `<span class="win-badge" data-open="${openMs}" data-close="${dayEndMs}" style="border-radius:5px;padding:2px 9px;font-size:.7rem">loading…</span>`;
 
   const secChip = s.secondaryMean !== null
     ? `<div class="chip">${s.secondaryLabel} <strong>${s.secondaryMean.toFixed(1)}°C${s.secondaryStd!==null?` ±${s.secondaryStd.toFixed(1)}`:''}</strong></div>`
+    : '';
+  const postChip = s.postprocess
+    ? `<div class="chip">MOS shift <strong>${s.postprocess.shiftC >= 0 ? '+' : ''}${s.postprocess.shiftC.toFixed(1)}°C</strong></div>`
+    : '';
+  const aviationChip = s.aviation
+    ? `<div class="chip">Obs max-so-far <strong>${s.aviation.observedMaxSoFarC.toFixed(1)}°C · ${s.aviation.observationCount} METARs</strong></div>`
+    : '';
+  const tafChip = s.taf && s.taf.multiplier < 1
+    ? `<div class="chip">TAF risk <strong>${s.taf.multiplier.toFixed(2)}x sizing</strong></div>`
     : '';
 
   // Arb banner
@@ -438,6 +576,9 @@ function buildCard(s: DateSnapshot, city: CityConfig): string {
     <span class="vol">${volStr}</span>
   </div>
   ${arbHtml}
+  ${s.postprocess ? `<div class="arb-banner"><div class="arb-title">Station post-processor</div><div class="arb-detail">Shift ${s.postprocess.shiftC >= 0 ? '+' : ''}${s.postprocess.shiftC.toFixed(2)}°C · rmse ${s.postprocess.rmseC.toFixed(2)}°C · n=${s.postprocess.sampleCount}</div></div>` : ''}
+  ${s.aviation ? `<div class="arb-banner"><div class="arb-title">Aviation station overlay</div><div class="arb-detail">${esc(s.aviation.summary)} · report ${esc(s.aviation.reportTime)}</div></div>` : ''}
+  ${s.taf && s.taf.multiplier < 1 ? `<div class="arb-banner"><div class="arb-title">TAF uncertainty overlay</div><div class="arb-detail">${esc(s.taf.summary)}</div></div>` : ''}
   <div class="chips">
     <div class="chip">ECMWF <strong>${s.ensembleMean.toFixed(1)}°C</strong></div>
     <div class="chip">σ <strong>±${s.ensembleStd.toFixed(1)}°C</strong></div>
@@ -445,6 +586,9 @@ function buildCard(s: DateSnapshot, city: CityConfig): string {
     <div class="chip">p90 <strong>${s.p90.toFixed(1)}°C</strong></div>
     <div class="chip">n <strong>${s.members.length} members</strong></div>
     ${secChip}
+    ${postChip}
+    ${aviationChip}
+    ${tafChip}
   </div>
   <div class="sl">Model vs Market</div>
   <div class="ch-main"><canvas id="bar-${city.id}-${s.date}"></canvas></div>
@@ -502,6 +646,7 @@ function buildChartJs(s: DateSnapshot, city: CityConfig): string {
 function mean(v: number[])   { return v.length ? v.reduce((a,b)=>a+b,0)/v.length : 0; }
 function stdDev(v: number[]) { if(!v.length)return 0; const m=mean(v); return Math.sqrt(v.reduce((a,b)=>a+(b-m)**2,0)/v.length); }
 function pct(v: number[], p: number) { if(!v.length)return 0; const s=[...v].sort((a,b)=>a-b); return s[Math.min(Math.floor(p/100*s.length),s.length-1)]; }
+function esc(v: string) { return v.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c] as string)); }
 
 // ---------------------------------------------------------------------------
 // Audit Log Panel — renders data/forward_test_log.csv as HTML table
@@ -558,6 +703,7 @@ function buildAuditPanel(): string {
   const statCards = `
   <div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:22px">
     ${statCard('Signals', String(rows.length))}
+    ${statCard('Tracked cities', String(PORTAL_CITY_IDS.length), '#93c5fd')}
     ${statCard('Order mode', orderMode, livePlaced > 0 ? '#f87171' : '#fbbf24')}
     ${statCard('Orders placed', String(livePlaced), livePlaced > 0 ? '#4ade80' : '#64748b')}
     ${statCard('Preview / Failed', `${previewCount} / ${failedCount}`, '#64748b')}
@@ -614,6 +760,7 @@ function buildAuditPanel(): string {
   <div style="margin-bottom:18px">
     <div class="city-title" style="margin-bottom:6px">Forward Test Audit Log</div>
     <div class="city-meta">All BUY signals since ${rows[0]?.logged_at.slice(0,10) ?? '—'} · updated every 15 min · ${IS_LIVE_NOTE}</div>
+    <div class="city-meta" style="margin-top:6px">Expansion scope: 20-city Celsius universe shared with the portal tabs and forward-test logger.</div>
   </div>
   ${statCards}
   <div style="overflow-x:auto">
