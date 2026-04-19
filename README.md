@@ -39,7 +39,7 @@ Normal trade evaluation is built from:
 - optional TAF risk overlay
 - live Polymarket market odds
 
-## Bet Timeframe
+## Trade Timeframe
 
 The strategy uses two time windows per market:
 
@@ -54,7 +54,7 @@ Definitions:
 - `T-8` means 8 hours before the local market close for that city/date
 - market close is the end of that calendar day in the city’s local timezone
 
-## Bet Selection Logic
+## Trade Selection Logic
 
 Inside an eligible window, the bot:
 
@@ -64,7 +64,7 @@ Inside an eligible window, the bot:
 4. applies single-market correlation filtering so only the best bracket remains actionable
 5. optionally replaces the best single with a 2-bracket basket if basket log-growth is better
 
-## Normal Bet Gates
+## Normal Trade Gates
 
 For a normal trade to qualify, the relevant bracket must pass all of these gates:
 
