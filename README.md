@@ -1,6 +1,6 @@
 # Clean Polymarket Weather Bot
 
-This repository is now a weather-market research and execution stack for smart contract on Polymarket.
+This repository is now a weather-market research and execution stack on a smart contract platform.
 
 The codebase focuses on daily high-temperature markets across multiple cities, using ensemble forecasts, market odds, forward-test logging, and a live portal to monitor trade eligibility, audit past signals, and track bankroll behavior.
 
