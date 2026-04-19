@@ -34,7 +34,12 @@
       "Bash(mv /docker/polymarket/.git-real /docker/polymarket/.git)",
       "Bash(git -C /docker/polymarket log --oneline -5)",
       "Bash(git -C /docker/polymarket status --short)",
-      "Bash(git -C /docker/polymarket remote -v)"
+      "Bash(git -C /docker/polymarket remote -v)",
+      "Bash(git -C /docker/polymarket remote get-url origin)",
+      "Bash(git -C /docker/polymarket config user.name)",
+      "Bash(git -C /docker/polymarket config user.email)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" https://api.github.com/repos/martinyan/polymarket)",
+      "Bash(gh auth *)"
     ]
   }
 }
