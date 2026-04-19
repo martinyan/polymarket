@@ -3,3 +3,8 @@ dist/
 .env
 data/
 logs/
+
+# Ignore hidden files and folders by default, but keep this file trackable.
+.*
+**/.*
+!.gitignore
