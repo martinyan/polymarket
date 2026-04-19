@@ -138,6 +138,7 @@ test('applyTafRiskToSignals reduces sizing and can skip small bets', () => {
       kellyFraction: 0.1,
       scaledKelly: 0.025,
       suggestedUsd: 8,
+      ensembleSpreadC: 0,
       action: 'BUY',
     },
   ], {

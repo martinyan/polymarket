@@ -2,9 +2,10 @@
  * Polymarket temperature bracket logic.
  *
  * Brackets are generated dynamically per city config:
- *   "{min}°C or below" | "{min+1}°C" … "{max-1}°C" | "{max}°C or higher"
+ *   "{min}° or below" | "{min+1}°" … "{max-1}°" | "{max}° or higher"
  *
- * Resolution is whole-degree Celsius only (Polymarket rounds to nearest integer).
+ * ECMWF ensemble member temps are always in Celsius; cities with unit='F'
+ * are converted to Fahrenheit before bucket assignment.
  */
 
 import { CityConfig } from './cities';
@@ -35,34 +36,36 @@ export function buildBracketsFromBounds(minBracket: number, maxBracket: number):
 
 /** Human-readable label for a bracket key */
 export function bracketLabel(bracket: Bracket, city: CityConfig): string {
-  if (bracket === `${city.minBracket}_or_below`) return `≤${city.minBracket}°C`;
-  if (bracket === `${city.maxBracket}_or_above`) return `≥${city.maxBracket}°C`;
-  return `${bracket}°C`;
+  const u = city.unit === 'F' ? 'F' : 'C';
+  if (bracket === `${city.minBracket}_or_below`) return `≤${city.minBracket}°${u}`;
+  if (bracket === `${city.maxBracket}_or_above`) return `≥${city.maxBracket}°${u}`;
+  return `${bracket}°${u}`;
 }
 
 /**
- * Map a continuous temperature to its bracket key for a given city.
- * Polymarket rounds to the nearest whole degree.
+ * Map a continuous temperature (always Celsius from ECMWF) to its bracket key.
+ * Cities with unit='F' are converted before bucketing.
  */
 export function tempToBracket(tempC: number, city: CityConfig): Bracket {
-  const rounded = Math.round(tempC);
+  const temp = city.unit === 'F' ? tempC * 9 / 5 + 32 : tempC;
+  const rounded = Math.round(temp);
   if (rounded <= city.minBracket) return `${city.minBracket}_or_below`;
   if (rounded >= city.maxBracket) return `${city.maxBracket}_or_above`;
   return String(rounded);
 }
 
 /**
- * Parse a Gamma API groupItemTitle like "13°C" or "8°C or below".
- * Polymarket shifts the 11-bracket range by city+date, so this must not rely
- * on the city-level default bounds.
+ * Parse a Gamma API groupItemTitle like "13°C", "60°F", "8°C or below", "84°F or higher".
+ * Handles both Celsius (all existing markets) and Fahrenheit (US cities).
+ * Polymarket shifts the 11-bracket range by city+date — don't rely on city-level bounds.
  */
 export function parseTemperatureMarketTitle(title: string): TemperatureMarketTitle | null {
   const t = title.trim();
-  const below = t.match(/^(-?\d+)°C or below$/);
+  const below = t.match(/^(-?\d+)°[CF] or below$/);
   if (below) return { kind: 'below', value: Number(below[1]) };
-  const above = t.match(/^(-?\d+)°C or higher$/);
+  const above = t.match(/^(-?\d+)°[CF] or higher$/);
   if (above) return { kind: 'above', value: Number(above[1]) };
-  const exact = t.match(/^(-?\d+)°C$/);
+  const exact = t.match(/^(-?\d+)°[CF]$/);
   if (exact) return { kind: 'exact', value: Number(exact[1]) };
   return null;
 }
@@ -105,6 +108,15 @@ export function computeBracketProbabilities(
   return Object.fromEntries(
     brackets.map(b => [b, total > 0 ? counts[b] / total : 0])
   );
+}
+
+/** Standard deviation of ensemble member temperatures — measures forecast uncertainty. */
+export function computeEnsembleSpread(temps: number[]): number {
+  if (temps.length < 2) return 0;
+  let sum = 0, sumSq = 0;
+  for (const t of temps) { sum += t; sumSq += t * t; }
+  const mean = sum / temps.length;
+  return Math.sqrt(Math.max(0, sumSq / temps.length - mean * mean));
 }
 
 export type EdgeRow = {

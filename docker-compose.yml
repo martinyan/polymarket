@@ -26,24 +26,36 @@ services:
     container_name: polymarket-weather-updater
     restart: unless-stopped
     working_dir: /app
-    # Schedule every 15 min:
+    # Schedule every 30 min:
     #   1. snapshot         — persist exact model/market context for future analysis
     #   2. forwardtest all  — log new signals, resolve closed-out picks, print report
     #   3. visualize        — rebuild HTML dashboard so audit log always reflects latest CSV
     #   4. health check     — log freshness status for the generated artifacts
     entrypoint: >
       sh -c "npm ci --silent &&
+             marker=\"/app/data/.postprocessors_trained_$$(date -u +%Y-%m-%d)\" &&
+             if [ ! -f \"$$marker\" ]; then
+               echo \"[$$(date -u '+%H:%M:%S UTC')] --- training station postprocessors ---\";
+               node_modules/.bin/tsx src/weather/train_postprocess.ts --city all 2>&1;
+               touch \"$$marker\";
+             else
+               echo \"[$$(date -u '+%H:%M:%S UTC')] --- postprocessors already trained today, skipping ---\";
+             fi &&
              while true; do
-               echo \"[$(date -u '+%H:%M:%S UTC')] --- snapshot ---\";
-               node_modules/.bin/tsx src/weather/snapshot.ts --days 3 2>&1;
-               echo \"[$(date -u '+%H:%M:%S UTC')] --- forwardtest ---\";
+               echo \"[$$(date -u '+%H:%M:%S UTC')] --- snapshot ---\";
+               node_modules/.bin/tsx src/weather/snapshot.ts --days 2 2>&1;
+               echo \"[$$(date -u '+%H:%M:%S UTC')] --- forwardtest ---\";
                node_modules/.bin/tsx src/weather/forwardtest.ts all --city all 2>&1;
-               echo \"[$(date -u '+%H:%M:%S UTC')] --- rebuilding dashboard ---\";
-               node_modules/.bin/tsx src/weather/visualize.ts --city all --days 7 2>&1;
-               echo \"[$(date -u '+%H:%M:%S UTC')] --- freshness check ---\";
+               echo \"[$$(date -u '+%H:%M:%S UTC')] --- rebuilding dashboard ---\";
+               node_modules/.bin/tsx src/weather/visualize.ts --city all --days 2 2>&1;
+               echo \"[$$(date -u '+%H:%M:%S UTC')] --- freshness check ---\";
                node_modules/.bin/tsx src/weather/freshness_check.ts 2>&1 || true;
-               echo \"[$(date -u '+%H:%M:%S UTC')] Done. Sleeping 15 min.\";
-               sleep 900;
+               now_s=$$(date +%s);
+               next=$$(( (now_s / 21600 + 1) * 21600 + 600 ));
+               wait=$$(( next - now_s ));
+               [ \"$$wait\" -lt 120 ] && wait=$$(( wait + 21600 ));
+               echo \"[$$(date -u '+%H:%M:%S UTC')] Done. Sleeping $${wait}s until next model run window.\";
+               sleep \"$$wait\";
              done"
     volumes:
       - .:/app

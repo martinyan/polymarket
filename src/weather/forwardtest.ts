@@ -19,7 +19,7 @@ import { ENV } from '../config';
 import { createTradingClient } from '../polymarket';
 import { fetchEcmwfEnsemble, fetchSecondaryForecast, EnsembleMember } from './ensemble';
 import { fetchMarketOdds, cityWithMarketBrackets, BracketMarket } from './polymarket_odds';
-import { computeBracketProbabilities, titleToBracket } from './brackets';
+import { computeBracketProbabilities, computeEnsembleSpread, titleToBracket } from './brackets';
 import {
   applySingleMarketKellyRecommendation,
   computeBetSignals,
@@ -28,6 +28,7 @@ import {
   findBestTwoBracketBasket,
 } from './ev';
 import { CITIES, CityConfig, FORWARD_TEST_CITY_IDS, TARGET_WEATHER_CITY_COUNT } from './cities';
+import { computeCityCalibrations } from './calibration';
 import { fetchJson } from '../http';
 import { applyLiveMetarTemperatureFloor, applyTafRiskToSignals, fetchStationNowcast, fetchTafRiskOverlay, StationNowcast, TafRiskOverlay } from './aviation';
 import {
@@ -38,7 +39,14 @@ import {
   validatePostProcessedBracketProbabilities,
 } from './postprocess';
 import { buildCurrentForecastFeatureRows } from './train_postprocess';
-import { cityDayEndUtcMs, tradeWindowOpenUtcMs } from './time';
+import { cityDayEndUtcMs } from './time';
+import {
+  FORCED_FALLBACK_WINDOW_HOURS,
+  NORMAL_TRADE_WINDOW_HOURS,
+  forcedFallbackWindowOpenUtcMs,
+  normalTradeWindowOpenUtcMs,
+  tradeWindowPhase,
+} from './forward_policy';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -85,16 +93,15 @@ function parseBasketLegs(notes: string): Array<{ bracket: string; price: number;
 }
 
 const CSV_PATH    = 'data/forward_test_log.csv';
+const SNAPSHOT_PATH = 'data/weather_snapshot_latest.json';
 const GAMMA_BASE  = 'https://gamma-api.polymarket.com';
 const STARTING_BANKROLL_USD = 1000;
+const SNAPSHOT_FALLBACK_MAX_AGE_MS = 24 * 60 * 60_000; // 24 h — covers full-day API outages; ECMWF data valid for same calendar day
+const FORCED_MARKET_MIN_USD = 1;
+const CITY_REQUEST_STAGGER_MS = 3000;
 
-// How many hours before a day ends (in local city time) we are allowed to enter a bet.
-const TRADE_WINDOW_HOURS = 8;
-
-/** Return ISO string showing when the trade window opens for a city+date. */
 function windowOpenStr(marketDate: string, timezone: string): string {
-  const openMs = tradeWindowOpenUtcMs(marketDate, timezone, TRADE_WINDOW_HOURS);
-  return new Date(openMs).toISOString();
+  return new Date(normalTradeWindowOpenUtcMs(marketDate, timezone)).toISOString();
 }
 
 const CSV_HEADERS: (keyof LogEntry)[] = [
@@ -105,6 +112,39 @@ const CSV_HEADERS: (keyof LogEntry)[] = [
 ];
 
 const IS_LIVE = !ENV.PREVIEW_MODE && !!ENV.PRIVATE_KEY;
+
+type SnapshotSignal = {
+  bracket: string;
+  label: string;
+  modelProb: number;
+  marketPrice: number;
+  edge: number;
+  evPerDollar: number;
+  kellyFraction: number;
+  suggestedUsd: number;
+  action: string;
+  reason?: string;
+};
+
+type SnapshotDay = {
+  date: string;
+  tradeWindowOpenUtc: string;
+  tradeWindowCloseUtc: string;
+  recommendation: 'single' | 'basket' | 'none';
+  signals: SnapshotSignal[];
+};
+
+type SnapshotCity = {
+  cityId: string;
+  cityName: string;
+  generatedAt: string;
+  days: SnapshotDay[];
+};
+
+type SnapshotRun = {
+  generatedAt: string;
+  cities: SnapshotCity[];
+};
 
 // ---------------------------------------------------------------------------
 // CSV I/O
@@ -173,6 +213,73 @@ function currentForwardTestBankroll(entries: LogEntry[]): number {
   return Math.max(0, STARTING_BANKROLL_USD + closedPnl - openRisk);
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function rotateCityIds(cityIds: readonly string[], offset: number): string[] {
+  if (!cityIds.length) return [];
+  const normalized = ((offset % cityIds.length) + cityIds.length) % cityIds.length;
+  return [...cityIds.slice(normalized), ...cityIds.slice(0, normalized)];
+}
+
+function loadLatestSnapshotRun(): SnapshotRun | null {
+  if (!existsSync(SNAPSHOT_PATH)) return null;
+  try {
+    return JSON.parse(readFileSync(SNAPSHOT_PATH, 'utf8')) as SnapshotRun;
+  } catch {
+    return null;
+  }
+}
+
+function snapshotFallbackDayForCity(city: CityConfig, snapshotRun: SnapshotRun | null): {
+  generatedAt: string;
+  day: SnapshotDay;
+} | null {
+  if (!snapshotRun) return null;
+  const snapshotGeneratedAtMs = Date.parse(snapshotRun.generatedAt);
+  if (!Number.isFinite(snapshotGeneratedAtMs)) return null;
+  if (Date.now() - snapshotGeneratedAtMs > SNAPSHOT_FALLBACK_MAX_AGE_MS) return null;
+
+  const citySnapshot = snapshotRun.cities.find(snapshotCity => snapshotCity.cityId === city.id || snapshotCity.cityName === city.name);
+  if (!citySnapshot) return null;
+
+  const day = citySnapshot.days
+    .filter(snapshotDay => {
+      const closeMs = Date.parse(snapshotDay.tradeWindowCloseUtc);
+      return Number.isFinite(closeMs) && closeMs > Date.now();
+    })
+    .sort((a, b) => a.date.localeCompare(b.date))[0];
+
+  if (!day) return null;
+  return { generatedAt: citySnapshot.generatedAt || snapshotRun.generatedAt, day };
+}
+
+function bestSnapshotBuy(day: SnapshotDay): SnapshotSignal | null {
+  return [...(day.signals ?? [])]
+    .filter(signal => signal.action === 'BUY')
+    .sort((a, b) => b.kellyFraction - a.kellyFraction)[0] ?? null;
+}
+
+function forcedSignalCandidate<T extends { modelProb: number; marketPrice: number; edge: number }>(signals: T[]): T | null {
+  return [...signals]
+    .filter(signal => Number.isFinite(signal.marketPrice) && signal.marketPrice > 0)
+    .sort((a, b) =>
+      b.modelProb - a.modelProb ||
+      b.edge - a.edge ||
+      a.marketPrice - b.marketPrice
+    )[0] ?? null;
+}
+
+function forcedStakeUsd(
+  signal: Pick<BetSignal, 'suggestedUsd'> | Pick<SnapshotSignal, 'suggestedUsd'>,
+  availableBankroll: number,
+): number {
+  if (!(availableBankroll > 0)) return 0;
+  const baselineStake = signal.suggestedUsd > 0 ? signal.suggestedUsd : FORCED_MARKET_MIN_USD;
+  return Math.min(baselineStake, availableBankroll);
+}
+
 // ---------------------------------------------------------------------------
 // Order execution — places a single BUY limit order on Polymarket CLOB
 // Returns { status, orderId }
@@ -220,11 +327,15 @@ async function placeOrder(
 // ---------------------------------------------------------------------------
 async function runLogger(cityIds: string[]): Promise<number> {
   const entries = readLog();
+  const cityCalibrations = computeCityCalibrations(entries);
   let added = 0;
+  const latestSnapshot = loadLatestSnapshotRun();
+  const rotatedCityIds = rotateCityIds(cityIds, Math.floor(Date.now() / 1_800_000) + 13);
 
-  for (const cityId of cityIds) {
+  for (const [index, cityId] of rotatedCityIds.entries()) {
     const city = CITIES[cityId];
     if (!city) continue;
+    if (index > 0) await sleep(CITY_REQUEST_STAGGER_MS);
 
     process.stdout.write(`  [${city.name}] fetching ensemble… `);
     let members: EnsembleMember[] = [];
@@ -232,7 +343,85 @@ async function runLogger(cityIds: string[]): Promise<number> {
       members = await fetchEcmwfEnsemble(city, 7);
       process.stdout.write(`${members.length} member-days`);
     } catch (e) {
-      process.stdout.write(`error: ${(e as Error).message}\n`);
+      const msg = (e as Error).message;
+      process.stdout.write(`error: ${msg}\n`);
+
+      const snapshotFallback = snapshotFallbackDayForCity(city, latestSnapshot);
+      const fallbackDay = snapshotFallback?.day ?? null;
+      const fallbackBest = fallbackDay ? bestSnapshotBuy(fallbackDay) : null;
+      const fallbackForced = fallbackDay ? forcedSignalCandidate(fallbackDay.signals ?? []) : null;
+      const fallbackChosen = fallbackBest ?? fallbackForced;
+      const fallbackNormalOpenMs = fallbackDay ? normalTradeWindowOpenUtcMs(fallbackDay.date, city.timezone) : Number.NaN;
+      const fallbackForcedOpenMs = fallbackDay ? forcedFallbackWindowOpenUtcMs(fallbackDay.date, city.timezone) : Number.NaN;
+      const fallbackCloseMs = fallbackDay ? Date.parse(fallbackDay.tradeWindowCloseUtc) : Number.NaN;
+      const nowMs = Date.now();
+
+      if (!snapshotFallback || !fallbackDay) {
+        process.stdout.write(`    - ${city.name} SNAPSHOT FALLBACK UNAVAILABLE\n`);
+        continue;
+      }
+      if (nowMs < fallbackNormalOpenMs) {
+        process.stdout.write(`    - ${city.name} snapshot fallback ${fallbackDay.date} normal T-${NORMAL_TRADE_WINDOW_HOURS} opens ${new Date(fallbackNormalOpenMs).toISOString()} (in ${((fallbackNormalOpenMs - nowMs) / 3_600_000).toFixed(1)}h)\n`);
+        continue;
+      }
+      if (!(nowMs < fallbackCloseMs)) {
+        process.stdout.write(`    - ${city.name} snapshot fallback ${fallbackDay.date} market closed\n`);
+        continue;
+      }
+      const forcedFallback = !fallbackBest;
+      if (forcedFallback && nowMs < fallbackForcedOpenMs) {
+        process.stdout.write(`    - ${city.name} snapshot fallback ${fallbackDay.date} forced fallback held until T-${FORCED_FALLBACK_WINDOW_HOURS} at ${new Date(fallbackForcedOpenMs).toISOString()} (in ${((fallbackForcedOpenMs - nowMs) / 3_600_000).toFixed(1)}h)\n`);
+        continue;
+      }
+      if (!fallbackChosen) {
+        process.stdout.write(`    - ${city.name} snapshot fallback ${fallbackDay.date} NO SIGNAL\n`);
+        continue;
+      }
+      if (isDuplicate(entries, city.name, fallbackDay.date)) {
+        process.stdout.write(`    - ${city.name} snapshot fallback ${fallbackDay.date} SKIP (already logged)\n`);
+        continue;
+      }
+
+      const availableBankroll = currentForwardTestBankroll(entries);
+      if (!(availableBankroll > 0)) {
+        process.stdout.write(`    - ${city.name} snapshot fallback ${fallbackDay.date} SKIP bankroll depleted\n`);
+        continue;
+      }
+      const stakeUsd = forcedStakeUsd(fallbackChosen, availableBankroll);
+
+      entries.push({
+        logged_at:      new Date().toISOString(),
+        city:           city.name,
+        market_date:    fallbackDay.date,
+        bracket:        String(fallbackChosen.bracket),
+        bracket_label:  fallbackChosen.label,
+        model_prob:     fallbackChosen.modelProb,
+        market_price:   fallbackChosen.marketPrice,
+        edge:           fallbackChosen.edge,
+        ev_per_dollar:  fallbackChosen.evPerDollar,
+        kelly_pct:      fallbackChosen.kellyFraction,
+        suggested_usd:  stakeUsd,
+        order_status:   forcedFallback
+          ? (IS_LIVE ? 'skipped-forced-snapshot-fallback' : 'preview-forced-snapshot-fallback')
+          : (IS_LIVE ? 'skipped-snapshot-fallback' : 'preview-snapshot-fallback'),
+        order_id:       '',
+        resolved:       false,
+        actual_bracket: '',
+        pnl:            0,
+        notes:          [
+          'snapshot_fallback=latest',
+          forcedFallback ? 'forced_market_trade=highest_model_prob' : '',
+          `snapshot_generated_at=${snapshotFallback.generatedAt}`,
+          `snapshot_age_h=${((Date.now() - Date.parse(snapshotFallback.generatedAt)) / 3_600_000).toFixed(1)}`,
+          `live_fetch_error=${msg.slice(0, 160)}`,
+          `normal_window_open=${new Date(fallbackNormalOpenMs).toISOString()}`,
+          forcedFallback ? `forced_window_open=${new Date(fallbackForcedOpenMs).toISOString()}` : '',
+          forcedFallback ? 'captured_in_forced_8h_window' : 'captured_in_normal_18h_window',
+          `bankroll=${availableBankroll.toFixed(2)}`,
+        ].join('; '),
+      });
+      process.stdout.write(`    + ${city.name} ${fallbackDay.date} ${fallbackChosen.label}  edge=${(fallbackChosen.edge * 100).toFixed(1)}%  EV=${(fallbackChosen.evPerDollar * 100).toFixed(1)}¢  bankroll=$${availableBankroll.toFixed(2)}  size=$${stakeUsd.toFixed(0)}  [${forcedFallback ? (IS_LIVE ? 'skipped-forced-snapshot-fallback' : 'preview-forced-snapshot-fallback') : (IS_LIVE ? 'skipped-snapshot-fallback' : 'preview-snapshot-fallback')}]${forcedFallback ? '  (forced highest model prob)' : ''}\n`);
+      added++;
       continue;
     }
 
@@ -248,6 +437,12 @@ async function runLogger(cityIds: string[]): Promise<number> {
     process.stdout.write('\n');
 
     const dates: string[] = [...new Set(members.map(m => m.date))].sort();
+    const tempsByDate = new Map<string, number[]>();
+    for (const m of members) {
+      const bucket = tempsByDate.get(m.date);
+      if (bucket) bucket.push(m.tempMaxC);
+      else tempsByDate.set(m.date, [m.tempMaxC]);
+    }
     const nowMs = Date.now();
     let stationNowcast: StationNowcast | null = null;
     try { stationNowcast = await fetchStationNowcast(city.stationCode); } catch {}
@@ -258,11 +453,12 @@ async function runLogger(cityIds: string[]): Promise<number> {
 
     for (const date of dates) {
       const dayEndMs      = cityDayEndUtcMs(date, city.timezone);
-      const windowStartMs = tradeWindowOpenUtcMs(date, city.timezone, TRADE_WINDOW_HOURS);
+      const normalWindowStartMs = normalTradeWindowOpenUtcMs(date, city.timezone);
+      const forcedWindowStartMs = forcedFallbackWindowOpenUtcMs(date, city.timezone);
 
-      if (nowMs < windowStartMs) {
+      if (nowMs < normalWindowStartMs) {
         // Too early — window not open yet; log when it opens
-        process.stdout.write(`  [${city.name}] ${date} window opens ${windowOpenStr(date, city.timezone)} (in ${((windowStartMs - nowMs) / 3_600_000).toFixed(1)}h)\n`);
+        process.stdout.write(`  [${city.name}] ${date} normal T-${NORMAL_TRADE_WINDOW_HOURS} window opens ${windowOpenStr(date, city.timezone)} (in ${((normalWindowStartMs - nowMs) / 3_600_000).toFixed(1)}h)\n`);
         continue;
       }
       if (nowMs >= dayEndMs) {
@@ -272,8 +468,8 @@ async function runLogger(cityIds: string[]): Promise<number> {
 
       const captureTime = new Date();
       const availableBankroll = currentForwardTestBankroll(entries);
-      if (availableBankroll < 5) {
-        console.log(`    - ${city.name} ${date} SKIP  available bankroll $${availableBankroll.toFixed(2)} below minimum order`);
+      if (!(availableBankroll > 0)) {
+        console.log(`    - ${city.name} ${date} SKIP  bankroll depleted`);
         continue;
       }
 
@@ -288,7 +484,7 @@ async function runLogger(cityIds: string[]): Promise<number> {
       }
 
       const marketCity = cityWithMarketBrackets(city, odds);
-      const baseTemps  = members.filter(m => m.date === date).map(m => m.tempMaxC);
+      const baseTemps  = tempsByDate.get(date) ?? [];
       const calibration = applyStationPostProcessorToTemps(city, baseTemps, featureRows.get(date) ?? {
         date,
         ecmwfMeanC: baseTemps.reduce((a, b) => a + b, 0) / Math.max(baseTemps.length, 1),
@@ -313,14 +509,19 @@ async function runLogger(cityIds: string[]): Promise<number> {
         ? (metarFloor.adjustment
             ? applyObservedFloorToProbabilities(probabilistic.probs, marketCity, metarFloor.adjustment.observedMaxSoFarC)
             : probabilistic.probs)
-        : computeBracketProbabilities(temps, marketCity, 0);
+        : computeBracketProbabilities(temps, marketCity, city.stationBiasC);
+      const ensembleSpread = computeEnsembleSpread(baseTemps);
+      const calib = cityCalibrations.get(city.name);
+      const kellyMult = calib?.kellyMultiplier ?? 1;
       const yesAskPrices = Object.fromEntries(odds.bracketMarkets.map(b => [b.bracket, b.yesAsk]));
       const signalPrices = Object.keys(yesAskPrices).length ? yesAskPrices : odds.probs;
-      const rawSignals = computeBetSignals(modelProbs, signalPrices, marketCity, availableBankroll);
+      const rawSignals = computeBetSignals(modelProbs, signalPrices, marketCity, availableBankroll, ensembleSpread, kellyMult);
       const tafAdjustedSignals = applyTafRiskToSignals(rawSignals, tafOverlay);
       const totalAboveThreshold = tafAdjustedSignals.filter(s => s.action === 'BUY').length;
       const signals = applySingleMarketKellyRecommendation(tafAdjustedSignals);
       const buySignals = signals.filter(s => s.action === 'BUY');
+      const windowPhase = tradeWindowPhase(date, city.timezone, nowMs);
+      const forced = windowPhase === 'forced_fallback' ? forcedSignalCandidate(signals) : null;
 
       // --- Correlated-bet guard ---
       // All brackets on the same city+date share the same temperature draw.
@@ -337,25 +538,73 @@ async function runLogger(cityIds: string[]): Promise<number> {
         bestBasket.profitProbability > best.modelProb + 1e-9
       );
 
-      if (!best) {
-        // No qualifying BUY signal — show the best candidate so we know why it was skipped
-        const topSkip = signals.filter(s => s.edge > 0).sort((a, b) => b.kellyFraction - a.kellyFraction)[0];
-        if (topSkip) {
-          console.log(`    - ${city.name} ${date} NO SIGNAL  best=${topSkip.label}  edge=${(topSkip.edge*100).toFixed(1)}%  Kelly=${(topSkip.kellyFraction*100).toFixed(1)}%  reason: ${topSkip.reason}`);
-        } else {
-          console.log(`    - ${city.name} ${date} NO SIGNAL  model agrees with market (no positive edge)`);
-        }
+      if (isDuplicate(entries, city.name, date)) {
+        console.log(`    - ${city.name} ${date} SKIP (already logged)`);
         continue;
       }
 
-      if (isDuplicate(entries, city.name, date)) {
-        console.log(`    - ${city.name} ${date} SKIP (already logged)`);
+      if (!best && windowPhase !== 'forced_fallback') {
+        console.log(`    - ${city.name} ${date} NO SIGNAL  waiting for normal BUY until forced fallback T-${FORCED_FALLBACK_WINDOW_HOURS} opens at ${new Date(forcedWindowStartMs).toISOString()}`);
+        continue;
+      }
+
+      if (!best && !forced) {
+        console.log(`    - ${city.name} ${date} NO SIGNAL  no executable market price available for forced fallback`);
         continue;
       }
 
       const note = totalAboveThreshold > 1
         ? `best of ${totalAboveThreshold} qualifying brackets (highest Kelly)`
         : '';
+
+      if (!best && forced) {
+        const stakeUsd = forcedStakeUsd(forced, availableBankroll);
+        const bm = odds.bracketMarkets.find(b => b.bracket === forced.bracket);
+        const { status: orderStatus, orderId } = bm
+          ? await placeOrder({
+              ...forced,
+              action: 'BUY',
+              suggestedUsd: stakeUsd,
+            }, bm, city, date)
+          : { status: 'skipped-no-token', orderId: '' };
+
+        entries.push({
+          logged_at:      captureTime.toISOString(),
+          city:           city.name,
+          market_date:    date,
+          bracket:        String(forced.bracket),
+          bracket_label:  forced.label,
+          model_prob:     forced.modelProb,
+          market_price:   forced.marketPrice,
+          edge:           forced.edge,
+          ev_per_dollar:  forced.evPerDollar,
+          kelly_pct:      forced.kellyFraction,
+          suggested_usd:  stakeUsd,
+          order_status:   `${orderStatus}-forced`,
+          order_id:       orderId,
+          resolved:       false,
+          actual_bracket: '',
+          pnl:            0,
+          notes:          [
+            'forced_market_trade=highest_model_prob',
+            forced.reason ? `forced_reason=${forced.reason}` : '',
+            calibration.adjustment ? `postprocess_shift=${calibration.adjustment.shiftC.toFixed(2)}C` : '',
+            calibration.adjustment?.p10C !== undefined && calibration.adjustment?.p90C !== undefined
+              ? `postprocess_q=${calibration.adjustment.p10C.toFixed(1)}/${(calibration.adjustment.p50C ?? calibration.adjustment.calibratedMeanC).toFixed(1)}/${calibration.adjustment.p90C.toFixed(1)}`
+              : '',
+            metarFloor.adjustment ? `aviation_floor=${metarFloor.adjustment.observedMaxSoFarC.toFixed(1)}C/${metarFloor.adjustment.method}/${metarFloor.adjustment.observationCount}obs` : '',
+            tafOverlay && tafOverlay.multiplier < 1 ? `taf_overlay=${tafOverlay.multiplier.toFixed(2)}x` : '',
+            `normal_window_open=${new Date(normalWindowStartMs).toISOString()}`,
+            `forced_window_open=${new Date(forcedWindowStartMs).toISOString()}`,
+            'captured_in_forced_8h_window',
+            `bankroll=${availableBankroll.toFixed(2)}`,
+          ].filter(Boolean).join('; '),
+        });
+
+        console.log(`    + ${city.name} ${date} ${forced.label}  edge=${(forced.edge*100).toFixed(1)}%  EV=${(forced.evPerDollar*100).toFixed(1)}¢  bankroll=$${availableBankroll.toFixed(2)}  size=$${stakeUsd.toFixed(0)}  [${orderStatus}-forced]  (forced highest model prob)`);
+        added++;
+        continue;
+      }
 
       if (useBasket && bestBasket) {
         const [legA, legB] = bestBasket.brackets.map(bracket => tafAdjustedSignals.find(signal => signal.bracket === bracket)).filter((signal): signal is BetSignal => !!signal);
@@ -390,8 +639,8 @@ async function runLogger(cityIds: string[]): Promise<number> {
                 : '',
               metarFloor.adjustment ? `aviation_floor=${metarFloor.adjustment.observedMaxSoFarC.toFixed(1)}C/${metarFloor.adjustment.method}/${metarFloor.adjustment.observationCount}obs` : '',
               tafOverlay && tafOverlay.multiplier < 1 ? `taf_overlay=${tafOverlay.multiplier.toFixed(2)}x` : '',
-              `window_open=${new Date(windowStartMs).toISOString()}`,
-              `captured_in_8h_window`,
+              `normal_window_open=${new Date(normalWindowStartMs).toISOString()}`,
+              `captured_in_normal_18h_window`,
               `bankroll=${availableBankroll.toFixed(2)}`,
             ].filter(Boolean).join('; '),
           });
@@ -426,14 +675,16 @@ async function runLogger(cityIds: string[]): Promise<number> {
         pnl:            0,
         notes:          [
           note,
+          `spread=${ensembleSpread.toFixed(1)}C`,
+          calib && calib.status !== 'insufficient' ? `calib=${calib.status}(bs=${calib.brierScore.toFixed(3)},n=${calib.sampleCount})` : '',
           calibration.adjustment ? `postprocess_shift=${calibration.adjustment.shiftC.toFixed(2)}C` : '',
           calibration.adjustment?.p10C !== undefined && calibration.adjustment?.p90C !== undefined
             ? `postprocess_q=${calibration.adjustment.p10C.toFixed(1)}/${(calibration.adjustment.p50C ?? calibration.adjustment.calibratedMeanC).toFixed(1)}/${calibration.adjustment.p90C.toFixed(1)}`
             : '',
           metarFloor.adjustment ? `aviation_floor=${metarFloor.adjustment.observedMaxSoFarC.toFixed(1)}C/${metarFloor.adjustment.method}/${metarFloor.adjustment.observationCount}obs` : '',
           tafOverlay && tafOverlay.multiplier < 1 ? `taf_overlay=${tafOverlay.multiplier.toFixed(2)}x` : '',
-          `window_open=${new Date(windowStartMs).toISOString()}`,
-          `captured_in_8h_window`,
+          `normal_window_open=${new Date(normalWindowStartMs).toISOString()}`,
+          `captured_in_normal_18h_window`,
           `bankroll=${availableBankroll.toFixed(2)}`,
         ].filter(Boolean).join('; '),
       });

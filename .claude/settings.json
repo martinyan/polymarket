@@ -1,0 +1,40 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm test *)",
+      "Bash(npm run *)",
+      "Bash([ ! -f \"/docker/polymarket/src/weather/$f.ts\" ])",
+      "Bash([ ! -f \"/docker/polymarket/src/$f.ts\" ])",
+      "Bash(npm -v)",
+      "Bash(docker build *)",
+      "Bash(node -e ' *)",
+      "WebFetch(domain:x.com)",
+      "WebFetch(domain:blog.devgenius.io)",
+      "WebFetch(domain:ezzekielnjuguna.medium.com)",
+      "WebFetch(domain:medium.com)",
+      "WebFetch(domain:polymarketanalytics.com)",
+      "WebFetch(domain:www.frenflow.com)",
+      "WebFetch(domain:www.odaily.news)",
+      "WebFetch(domain:www.tradetheoutcome.com)",
+      "WebFetch(domain:celsi.markets)",
+      "WebFetch(domain:weatherbot.finance)",
+      "WebFetch(domain:dev.to)",
+      "WebFetch(domain:www.publish0x.com)",
+      "WebFetch(domain:wethr.net)",
+      "WebFetch(domain:www.interactivebrokers.com)",
+      "WebFetch(domain:www.climatesight.app)",
+      "WebFetch(domain:www.bloomberg.com)",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('exactLabelSource:', d.get\\('exactLabelSource'\\)\\); print\\('sampleCount:', d.get\\('sampleCount'\\)\\); print\\('meanBiasC:', d.get\\('meanBiasC'\\)\\); print\\('trainingStart:', d.get\\('trainingStartDate'\\)\\); print\\('trainingEnd:', d.get\\('trainingEndDate'\\)\\)\")",
+      "Bash(node_modules/.bin/tsc --noEmit)",
+      "Bash(rm /docker/polymarket/.git)",
+      "Bash(git -C /docker/polymarket init)",
+      "Bash(git -C /docker/polymarket status)",
+      "Bash(git --git-dir=/docker/polymarket/.git-real log --oneline -5)",
+      "Bash(rm -rf /docker/polymarket/.git)",
+      "Bash(mv /docker/polymarket/.git-real /docker/polymarket/.git)",
+      "Bash(git -C /docker/polymarket log --oneline -5)",
+      "Bash(git -C /docker/polymarket status --short)",
+      "Bash(git -C /docker/polymarket remote -v)"
+    ]
+  }
+}

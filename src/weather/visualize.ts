@@ -22,17 +22,24 @@ import {
   validatePostProcessedBracketProbabilities,
 } from './postprocess';
 import { buildCurrentForecastFeatureRows } from './train_postprocess';
-import { cityDayEndUtcMs, tradeWindowOpenUtcMs } from './time';
+import { cityDayEndUtcMs } from './time';
+import { computeCityCalibrations, CityCalibration } from './calibration';
+import {
+  FORCED_FALLBACK_WINDOW_HOURS,
+  NORMAL_TRADE_WINDOW_HOURS,
+  forcedFallbackWindowOpenUtcMs,
+  normalTradeWindowOpenUtcMs,
+  tradeWindowPhase,
+} from './forward_policy';
 import { ENV as _ENV } from '../config';
 const IS_LIVE_NOTE = _ENV.PREVIEW_MODE ? '🟡 PREVIEW MODE — no real orders placed' : '🔴 LIVE MODE — real orders placed';
 
 // ---------------------------------------------------------------------------
 // Trade window helpers (mirrors forwardtest.ts logic)
 // ---------------------------------------------------------------------------
-const TRADE_WINDOW_HOURS = 8;
 function tradeWindowStatus(date: string, tz: string): { open: boolean; opensAt: string; closesAt: string } {
   const dayEndMs   = cityDayEndUtcMs(date, tz);
-  const openMs     = tradeWindowOpenUtcMs(date, tz, TRADE_WINDOW_HOURS);
+  const openMs     = normalTradeWindowOpenUtcMs(date, tz);
   const now        = Date.now();
   const fmt = (ms: number) => new Date(ms).toISOString().slice(11, 16) + ' UTC';
   return { open: now >= openMs && now < dayEndMs, opensAt: fmt(openMs), closesAt: fmt(dayEndMs) };
@@ -42,10 +49,11 @@ function tradeWindowStatus(date: string, tz: string): { open: boolean; opensAt: 
 // CLI args
 // ---------------------------------------------------------------------------
 const args = process.argv.slice(2);
-let forecastDays   = 7;
+let forecastDays   = 2;
 let biasCorrection = 0;
 let bankrollUsd    = 1000;
 let outPath        = 'data/weather_analysis.html';
+const CITY_REQUEST_STAGGER_MS = 1200;
 
 const cityIdx = args.indexOf('--city');
 const cityArg = cityIdx !== -1 ? args[cityIdx + 1] : 'all';
@@ -118,12 +126,17 @@ type PersistedSnapshotRun = {
 };
 
 type ForwardLogRow = {
-  logged_at: string;
-  city: string;
-  market_date: string;
-  suggested_usd: number;
-  resolved: boolean;
-  pnl: number;
+  logged_at:      string;
+  city:           string;
+  market_date:    string;
+  bracket:        string;
+  model_prob:     number;
+  suggested_usd:  number;
+  order_status:   string;
+  order_id:       string;
+  resolved:       boolean;
+  actual_bracket: string;
+  pnl:            number;
 };
 
 type IndexedSnapshotDay = PersistedSnapshotDay & {
@@ -182,12 +195,17 @@ function loadForwardTestState(): {
     const hasOrderCols = cols.length >= 17;
     const base = hasOrderCols ? 2 : 0;
     return {
-      logged_at: cols[0] ?? '',
-      city: cols[1] ?? '',
-      market_date: cols[2] ?? '',
-      suggested_usd: parseFloat(cols[10] ?? '0'),
-      resolved: cols[11 + base] === 'true',
-      pnl: parseFloat(cols[13 + base] ?? '0'),
+      logged_at:      cols[0] ?? '',
+      city:           cols[1] ?? '',
+      market_date:    cols[2] ?? '',
+      bracket:        cols[3] ?? '',
+      model_prob:     parseFloat(cols[5] ?? '0'),
+      suggested_usd:  parseFloat(cols[10] ?? '0'),
+      order_status:   cols[11] ?? '',
+      order_id:       cols[12] ?? '',
+      resolved:       cols[11 + base] === 'true',
+      actual_bracket: (cols[12 + base] ?? '').replace(/^"|"$/g, ''),
+      pnl:            parseFloat(cols[13 + base] ?? '0'),
     };
   });
 
@@ -201,6 +219,16 @@ function loadForwardTestState(): {
     bankrollUsd: Math.max(0, 1000 + closedPnl - openRisk),
     startedAt: entries[0]?.logged_at ?? null,
   };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function rotateCityIds(cityIds: readonly string[], offset: number): string[] {
+  if (!cityIds.length) return [];
+  const normalized = ((offset % cityIds.length) + cityIds.length) % cityIds.length;
+  return [...cityIds.slice(normalized), ...cityIds.slice(0, normalized)];
 }
 
 // ---------------------------------------------------------------------------
@@ -305,6 +333,7 @@ async function fetchCityData(city: CityConfig): Promise<CityResult> {
             kellyFraction: signal.kellyFraction,
             scaledKelly: signal.kellyFraction * 0.25,
             suggestedUsd: signal.suggestedUsd,
+            ensembleSpreadC: 0,
             action: signal.action as BetSignal['action'],
             reason: signal.reason,
           }))
@@ -338,7 +367,8 @@ async function fetchCityData(city: CityConfig): Promise<CityResult> {
 // Main
 // ---------------------------------------------------------------------------
 async function main() {
-  const cities = cityIds.map(id => {
+  const rotatedCityIds = rotateCityIds(cityIds, Math.floor(Date.now() / 1_800_000) + 7);
+  const cities = rotatedCityIds.map(id => {
     const c = CITIES[id];
     if (!c) throw new Error(`Unknown city "${id}". Valid: ${Object.keys(CITIES).join(', ')}`);
     return c;
@@ -346,7 +376,8 @@ async function main() {
 
   console.log(`\nFetching data for: ${cities.map(c => c.name).join(', ')}\n`);
   const results: CityResult[] = [];
-  for (const city of cities) {
+  for (const [index, city] of cities.entries()) {
+    if (index > 0) await sleep(CITY_REQUEST_STAGGER_MS);
     try {
       results.push(await fetchCityData(city));
     } catch (error) {
@@ -545,6 +576,46 @@ function updateWindows(){
       el.closest('.card')&&el.closest('.card').classList.remove('has-window');
     }
   });
+  document.querySelectorAll('.forward-live-banner').forEach(el=>{
+    const openMs=parseInt(el.dataset.open), closeMs=parseInt(el.dataset.close);
+    const titleEl=el.querySelector('.forward-live-title');
+    const detailEl=el.querySelector('.forward-live-detail');
+    if(!titleEl || !detailEl) return;
+    if(now>=closeMs){
+      el.style.background='#3f1d1d';
+      el.style.borderColor='#7f1d1d';
+      titleEl.style.color='#fecaca';
+      detailEl.style.color='#fecaca';
+      titleEl.textContent='Blocked: Market Closed';
+      detailEl.textContent='This event is already past the local market day close, so forward test will not open a new paper trade.';
+    } else if(now>=openMs){
+      el.style.background='#0f2f1f';
+      el.style.borderColor='#166534';
+      titleEl.style.color='#86efac';
+      detailEl.style.color='#bbf7d0';
+      titleEl.textContent='Forward-Test Eligible Now';
+      detailEl.textContent=el.dataset.eligibleDetail || 'This card can be logged now.';
+    } else {
+      el.style.background='#3f1d1d';
+      el.style.borderColor='#7f1d1d';
+      titleEl.style.color='#fecaca';
+      detailEl.style.color='#fecaca';
+      titleEl.textContent='Blocked: Window Not Open';
+      detailEl.textContent='Normal forward-test entries open in the final 18h window. Forced fallback stays reserved for the final 8h. Normal window opens '+new Date(openMs).toISOString()+'.';
+    }
+  });
+  document.querySelectorAll('.forward-live-chip-wrap').forEach(el=>{
+    const openMs=parseInt(el.dataset.open), closeMs=parseInt(el.dataset.close);
+    const chipStrong=el.querySelector('.forward-live-chip');
+    if(!chipStrong) return;
+    if(now>=openMs && now<closeMs){
+      el.classList.remove('chip-warn');
+      chipStrong.textContent='eligible now';
+    } else {
+      el.classList.add('chip-warn');
+      chipStrong.textContent='blocked';
+    }
+  });
 }
 updateWindows();
 setInterval(updateWindows, 1000);
@@ -585,22 +656,32 @@ function forwardEligibilityForSnapshot(s: DateSnapshot, city: CityConfig): {
   detail: string;
 } {
   const bestBuy = s.signals.find(signal => signal.action === 'BUY');
-  if (!bestBuy) {
+  const forcedFallback = [...s.signals]
+    .filter(signal => Number.isFinite(signal.marketPrice) && signal.marketPrice > 0)
+    .sort((a, b) =>
+      b.modelProb - a.modelProb ||
+      b.edge - a.edge ||
+      a.marketPrice - b.marketPrice
+    )[0];
+  const chosenSignal = bestBuy ?? forcedFallback;
+  if (!chosenSignal) {
     return {
       status: 'no_buy',
       label: 'No Forward-Test Trade',
-      detail: 'No BUY survived the forward-test thresholds after Kelly, EV, and single-market selection.',
+      detail: 'No BUY survived the forward-test thresholds and there is no executable market price for forced fallback.',
     };
   }
 
   const dayEndMs = cityDayEndUtcMs(s.date, city.timezone);
-  const openMs = tradeWindowOpenUtcMs(s.date, city.timezone, TRADE_WINDOW_HOURS);
+  const normalOpenMs = normalTradeWindowOpenUtcMs(s.date, city.timezone);
+  const forcedOpenMs = forcedFallbackWindowOpenUtcMs(s.date, city.timezone);
   const nowMs = Date.now();
-  if (nowMs < openMs) {
+  const phase = tradeWindowPhase(s.date, city.timezone, nowMs);
+  if (phase === 'before_normal') {
     return {
       status: 'window_not_open',
       label: 'Blocked: Window Not Open',
-      detail: `Forward test only logs within the final ${TRADE_WINDOW_HOURS}h window. Opens ${new Date(openMs).toISOString()}.`,
+      detail: `Normal forward-test entries open in the final ${NORMAL_TRADE_WINDOW_HOURS}h window. Opens ${new Date(normalOpenMs).toISOString()}. Forced fallback stays held until ${new Date(forcedOpenMs).toISOString()} (${FORCED_FALLBACK_WINDOW_HOURS}h before close).`,
     };
   }
   if (nowMs >= dayEndMs) {
@@ -610,11 +691,11 @@ function forwardEligibilityForSnapshot(s: DateSnapshot, city: CityConfig): {
       detail: 'This event is already past the local market day close, so forward test will not open a new paper trade.',
     };
   }
-  if (forwardTestState.bankrollUsd < 5) {
+  if (!(forwardTestState.bankrollUsd > 0)) {
     return {
       status: 'bankroll',
       label: 'Blocked: Bankroll',
-      detail: `Available forward-test bankroll is $${forwardTestState.bankrollUsd.toFixed(2)}, below the $5 minimum order.`,
+      detail: 'Available forward-test bankroll is depleted, so forward test cannot log another paper trade.',
     };
   }
   if (forwardTestState.unresolvedKeys.has(`${city.name}|${s.date}`)) {
@@ -626,8 +707,10 @@ function forwardEligibilityForSnapshot(s: DateSnapshot, city: CityConfig): {
   }
   return {
     status: 'eligible_now',
-    label: 'Forward-Test Eligible Now',
-    detail: `Best bracket ${bestBuy.label} passes thresholds and can be logged now at current bankroll $${forwardTestState.bankrollUsd.toFixed(2)}.`,
+    label: bestBuy ? 'Forward-Test Eligible Now' : 'Forced Forward-Test Trade',
+    detail: bestBuy
+      ? `Best bracket ${bestBuy.label} passes thresholds and can be logged now at current bankroll $${forwardTestState.bankrollUsd.toFixed(2)}.`
+      : `No bracket passed the normal gates by ${FORCED_FALLBACK_WINDOW_HOURS}h to close, so forward test will force the highest model-probability bracket ${chosenSignal.label} for this market.`,
   };
 }
 
@@ -672,7 +755,7 @@ function buildCard(s: DateSnapshot, city: CityConfig): string {
   const volStr    = s.volume ? `$${Math.round(s.volume/1000)}K vol · $${Math.round(s.liquidity/1000)}K liq` : 'no market';
   const win       = tradeWindowStatus(s.date, city.timezone);
   const dayEndMs  = cityDayEndUtcMs(s.date, city.timezone);
-  const openMs    = tradeWindowOpenUtcMs(s.date, city.timezone, TRADE_WINDOW_HOURS);
+  const openMs    = normalTradeWindowOpenUtcMs(s.date, city.timezone);
   // Embed UTC epoch timestamps as data attrs — client JS updates every second
   const winBadge  = `<span class="win-badge" data-open="${openMs}" data-close="${dayEndMs}" style="border-radius:5px;padding:2px 9px;font-size:.7rem">loading…</span>`;
 
@@ -689,7 +772,22 @@ function buildCard(s: DateSnapshot, city: CityConfig): string {
   const marketSourceChip = `<div class="chip${marketStale ? ' chip-warn' : ''}">Market <strong>${s.marketDataSource === 'live' ? 'live asks' : s.marketDataSource === 'snapshot' ? 'snapshot fallback' : 'missing'}</strong>${marketAge ? ` · ${marketAge}` : ''}</div>`;
   const signalSourceChip = `<div class="chip${signalStale ? ' chip-warn' : ''}">Signals <strong>${s.signalSource === 'live' ? 'fresh' : 'cached'}</strong>${signalAge ? ` · ${signalAge}` : ''}</div>`;
   const forwardEligibility = forwardEligibilityForSnapshot(s, city);
-  const forwardChip = `<div class="chip${forwardEligibility.status === 'eligible_now' ? '' : ' chip-warn'}">Forward test <strong>${forwardEligibility.status === 'eligible_now' ? 'eligible now' : 'blocked'}</strong></div>`;
+  const liveForwardStatus = forwardEligibility.status === 'eligible_now' || forwardEligibility.status === 'window_not_open';
+  const bestBuy = s.signals.find(signal => signal.action === 'BUY');
+  const forcedFallback = [...s.signals]
+    .filter(signal => Number.isFinite(signal.marketPrice) && signal.marketPrice > 0)
+    .sort((a, b) =>
+      b.modelProb - a.modelProb ||
+      b.edge - a.edge ||
+      a.marketPrice - b.marketPrice
+    )[0];
+  const chosenSignal = bestBuy ?? forcedFallback;
+  const eligibleDetail = bestBuy
+    ? `Best bracket ${bestBuy.label} passes thresholds and can be logged now at current bankroll $${forwardTestState.bankrollUsd.toFixed(2)}.`
+    : chosenSignal
+      ? `Forced fallback will log ${chosenSignal.label} as the highest model-probability bracket for this market.`
+      : 'This card can be logged now.';
+  const forwardChip = `<div class="chip${forwardEligibility.status === 'eligible_now' ? '' : ' chip-warn'}${liveForwardStatus ? ' forward-live-chip-wrap' : ''}"${liveForwardStatus ? ` data-open="${openMs}" data-close="${dayEndMs}"` : ''}>Forward test <strong class="${liveForwardStatus ? 'forward-live-chip' : ''}">${forwardEligibility.status === 'eligible_now' ? 'eligible now' : 'blocked'}</strong></div>`;
   const aviationChip = s.aviation
     ? `<div class="chip">Obs max-so-far <strong>${s.aviation.observedMaxSoFarC.toFixed(1)}°C · ${s.aviation.observationCount} METARs</strong></div>`
     : '';
@@ -725,6 +823,10 @@ function buildCard(s: DateSnapshot, city: CityConfig): string {
   // Identify the single best bracket to trade (highest Kelly among BUYs, above price floor)
   const buySignals   = s.signals.filter(x => x.action === 'BUY');
   const bestBracket  = buySignals.sort((a, b) => b.kellyFraction - a.kellyFraction)[0]?.bracket;
+  const forwardBannerClass = liveForwardStatus ? 'arb-banner forward-live-banner' : 'arb-banner';
+  const forwardBannerAttrs = liveForwardStatus
+    ? ` data-open="${openMs}" data-close="${dayEndMs}" data-eligible-detail="${esc(eligibleDetail)}"`
+    : '';
 
   // Combined edge + EV + Kelly table
   const tableRows = edgeRows.map(row => {
@@ -767,9 +869,9 @@ function buildCard(s: DateSnapshot, city: CityConfig): string {
     <span class="vol">${volStr}</span>
   </div>
   ${arbHtml}
-  <div class="arb-banner" style="background:${forwardEligibility.status === 'eligible_now' ? '#0f2f1f' : '#3f1d1d'};border-color:${forwardEligibility.status === 'eligible_now' ? '#166534' : '#7f1d1d'}">
-    <div class="arb-title" style="color:${forwardEligibility.status === 'eligible_now' ? '#86efac' : '#fecaca'}">${forwardEligibility.label}</div>
-    <div class="arb-detail" style="color:${forwardEligibility.status === 'eligible_now' ? '#bbf7d0' : '#fecaca'}">${esc(forwardEligibility.detail)}</div>
+  <div class="${forwardBannerClass}"${forwardBannerAttrs} style="background:${forwardEligibility.status === 'eligible_now' ? '#0f2f1f' : '#3f1d1d'};border-color:${forwardEligibility.status === 'eligible_now' ? '#166534' : '#7f1d1d'}">
+    <div class="arb-title forward-live-title" style="color:${forwardEligibility.status === 'eligible_now' ? '#86efac' : '#fecaca'}">${forwardEligibility.label}</div>
+    <div class="arb-detail forward-live-detail" style="color:${forwardEligibility.status === 'eligible_now' ? '#bbf7d0' : '#fecaca'}">${esc(forwardEligibility.detail)}</div>
   </div>
   ${s.marketDataSource !== 'live' ? `<div class="arb-banner" style="background:#3f1d1d;border-color:#7f1d1d"><div class="arb-title" style="color:#fecaca">Stale market fallback</div><div class="arb-detail" style="color:#fecaca">Live market odds were unavailable during this rebuild, so this card is using the last good cached snapshot${marketAge ? ` captured ${marketAge}` : ''}.</div></div>` : ''}
   ${s.postprocess ? `<div class="arb-banner"><div class="arb-title">Station post-processor</div><div class="arb-detail">Shift ${s.postprocess.shiftC >= 0 ? '+' : ''}${s.postprocess.shiftC.toFixed(2)}°C · rmse ${s.postprocess.rmseC.toFixed(2)}°C · n=${s.postprocess.sampleCount}</div></div>` : ''}
@@ -860,7 +962,7 @@ function buildAuditPanel(): string {
   if (raw.length <= 1) return `<div style="padding:24px;color:#64748b">No signals logged yet.</div>`;
 
   // Parse rows — support both 15-col (old) and 17-col (new, with order_status+order_id)
-  type Row = { logged_at:string; city:string; market_date:string; bracket_label:string;
+  type Row = { logged_at:string; city:string; market_date:string; bracket:string; bracket_label:string;
                model_prob:number; market_price:number; edge:number; ev_per_dollar:number;
                kelly_pct:number; suggested_usd:number; order_status:string; order_id:string;
                resolved:boolean; actual_bracket:string; pnl:number; notes:string };
@@ -872,6 +974,7 @@ function buildAuditPanel(): string {
       logged_at:      c[0]  ?? '',
       city:           c[1]  ?? '',
       market_date:    c[2]  ?? '',
+      bracket:        c[3]  ?? '',
       bracket_label:  c[4]  ?? '',
       model_prob:     parseFloat(c[5]  ?? '0'),
       market_price:   parseFloat(c[6]  ?? '0'),
@@ -899,6 +1002,53 @@ function buildAuditPanel(): string {
   const failedCount = rows.filter(r => r.order_status.startsWith('failed')).length;
   const orderMode = livePlaced > 0 ? '🔴 LIVE' : '🟡 PREVIEW';
 
+  const calibrations = computeCityCalibrations(rows);
+
+  const calibStatusColor = (s: CityCalibration['status']) =>
+    s === 'good'         ? '#4ade80' :
+    s === 'degraded'     ? '#fbbf24' :
+    s === 'poor'         ? '#f97316' :
+    s === 'skip'         ? '#f87171' :
+    '#64748b'; // insufficient
+
+  const calibTableRows = PORTAL_CITY_IDS.map(id => {
+    const city = CITIES[id];
+    if (!city) return '';
+    const c = calibrations.get(city.name);
+    const bs   = c && c.status !== 'insufficient' ? c.brierScore.toFixed(3) : '—';
+    const wr   = c && c.status !== 'insufficient' ? (c.winRate * 100).toFixed(0) + '%' : '—';
+    const n    = c ? String(c.sampleCount) : '0';
+    const mult = c && c.status !== 'insufficient' ? c.kellyMultiplier.toFixed(1) + '×' : '1.0×';
+    const status = c?.status ?? 'insufficient';
+    const color  = calibStatusColor(status);
+    return `<tr style="border-top:1px solid #1e293b">
+      <td style="padding:4px 8px;color:#e2e8f0;font-size:.75rem">${city.name}</td>
+      <td style="padding:4px 8px;color:${color};font-size:.75rem;font-weight:700">${status.toUpperCase()}</td>
+      <td style="padding:4px 8px;color:#94a3b8;font-size:.75rem;text-align:right">${bs}</td>
+      <td style="padding:4px 8px;color:#94a3b8;font-size:.75rem;text-align:right">${n}</td>
+      <td style="padding:4px 8px;color:#94a3b8;font-size:.75rem;text-align:right">${wr}</td>
+      <td style="padding:4px 8px;color:${color};font-size:.75rem;text-align:right">${mult}</td>
+    </tr>`;
+  }).join('');
+
+  const calibSection = `
+  <details style="margin-bottom:20px">
+    <summary style="cursor:pointer;color:#93c5fd;font-size:.8rem;font-weight:600;padding:6px 0">
+      Model Calibration (Brier Score, last ${30} resolved per city)
+    </summary>
+    <table style="width:100%;border-collapse:collapse;margin-top:8px;background:#0f172a;border-radius:6px;overflow:hidden">
+      <thead><tr style="background:#1e293b">
+        <th style="padding:6px 8px;color:#64748b;font-size:.7rem;text-align:left">City</th>
+        <th style="padding:6px 8px;color:#64748b;font-size:.7rem;text-align:left">Status</th>
+        <th style="padding:6px 8px;color:#64748b;font-size:.7rem;text-align:right">Brier</th>
+        <th style="padding:6px 8px;color:#64748b;font-size:.7rem;text-align:right">Samples</th>
+        <th style="padding:6px 8px;color:#64748b;font-size:.7rem;text-align:right">Win%</th>
+        <th style="padding:6px 8px;color:#64748b;font-size:.7rem;text-align:right">Kelly×</th>
+      </tr></thead>
+      <tbody>${calibTableRows}</tbody>
+    </table>
+  </details>`;
+
   const statCards = `
   <div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:22px">
     ${statCard('Signals', String(rows.length))}
@@ -911,7 +1061,8 @@ function buildAuditPanel(): string {
     ${statCard('Win rate', closed.length ? (wins.length/closed.length*100).toFixed(1)+'%' : '—', wins.length > 0 ? '#4ade80' : '#94a3b8')}
     ${statCard('Total P&L', (totalPnl>=0?'+':'')+'$'+totalPnl.toFixed(2), totalPnl>=0?'#4ade80':'#f87171')}
     ${statCard('ROI', totalRisked>0?(totalPnl/totalRisked*100).toFixed(1)+'%':'—', totalPnl>=0?'#4ade80':'#f87171')}
-  </div>`;
+  </div>
+  ${calibSection}`;
 
   const tableRows = [...rows].sort((a,b)=>b.logged_at.localeCompare(a.logged_at)).map(r => {
     const orderBadge = r.order_status === 'placed'

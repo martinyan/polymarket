@@ -1,123 +1,218 @@
-# Clean Polymarket Copy Bot
+# Clean Polymarket Weather Bot
 
-This is a preview-first Polymarket copy-trading bot scaffolded from scratch with a narrow dependency set and conservative live-trading defaults.
+This repository is now a weather-market research and execution stack for Polymarket, not a copy-trading bot.
 
-## Safety model
+The codebase focuses on daily high-temperature markets across multiple cities, using ensemble forecasts, market odds, forward-test logging, and a live portal to monitor trade eligibility, audit past signals, and track bankroll behavior.
 
-- Uses only Polymarket-hosted endpoints plus the official TypeScript CLOB client
-- Defaults to `PREVIEW_MODE=true`
-- Persists only a small local state file with processed activity IDs
-- Retries transient poll failures without losing already-processed state
-- Starts with conservative copy sizing for first live rollout
+## What The Bot Does
 
-## Current behavior
+- fetches ECMWF ensemble weather forecasts for tracked cities
+- optionally blends in a secondary forecast model for some markets
+- applies station-level post-processing and live aviation overlays
+- reads live Polymarket weather odds
+- computes bracket probabilities, edge, EV, Kelly sizing, and basket alternatives
+- logs forward-test trades into `data/forward_test_log.csv`
+- rebuilds a portal at `data/weather_analysis.html`
+- stores fresh market/model snapshots in `data/weather_snapshot_latest.json`
 
-- Polls selected trader activity from the public Data API
-- Enriches markets from the public Gamma API
-- Filters trades by strategy and safety rules
-- Reuses the same `.env` keyword filter for live trading and backtesting
-- Emits structured JSON logs for preview, skip, error, and live-order events
-- In preview mode: logs the exact copy order it would place
-- In live mode: places BUY-side limit orders using the official CLOB client
+## Current Strategy
 
-## Supported safety checks
+The active strategy is a weather-only forward-test system built around one unresolved position per `city + market_date`.
 
-- Missing asset token id
-- Missing condition id
-- SELL activity when `BUY_ONLY=true`
-- Gamma market condition mismatch
-- Gamma market token mismatch when token ids are available
-- Disabled order book
-- Invalid price
-- Disallowed tags
-- Blocked market slugs
-- Order below configured minimum
+It is designed to:
+
+- prefer normal threshold-passing trades
+- enter earlier than before, but not too early
+- preserve continuity when upstream weather APIs fail
+- force at least one logged trade per market only as a last resort
+
+The detailed forward-test audit logic is documented in [FORWARD_TEST_LOGIC.md](FORWARD_TEST_LOGIC.md).
+
+## Forecast Inputs
+
+Normal trade evaluation is built from:
+
+- ECMWF ensemble forecast
+- optional secondary model blend
+- station post-processing / MOS-style calibration
+- live METAR observed temperature floor
+- optional TAF risk overlay
+- live Polymarket market odds
+
+## Bet Timeframe
+
+The strategy uses two time windows per market:
+
+- `T-18` to market close:
+  normal threshold-passing trades are allowed
+- `T-8` to market close:
+  forced continuity fallback becomes allowed if no normal trade survives
+
+Definitions:
+
+- `T-18` means 18 hours before the local market close for that city/date
+- `T-8` means 8 hours before the local market close for that city/date
+- market close is the end of that calendar day in the city’s local timezone
+
+## Bet Selection Logic
+
+Inside an eligible window, the bot:
+
+1. converts forecast temperatures into bracket probabilities
+2. compares model probability against live Polymarket ask prices
+3. computes edge, EV per dollar, and Kelly fraction
+4. applies single-market correlation filtering so only the best bracket remains actionable
+5. optionally replaces the best single with a 2-bracket basket if basket log-growth is better
+
+## Normal Bet Gates
+
+For a normal trade to qualify, the relevant bracket must pass all of these gates:
+
+- live executable market price must exist
+- market price must be greater than `0`
+- market price must be at least `5¢`
+- model edge must be positive
+- Kelly fraction must exceed the configured minimum
+- EV per dollar must exceed the configured minimum
+- after correlation filtering, only the highest-Kelly bracket remains actionable
+
+Sizing rules:
+
+- quarter-Kelly sizing is used
+- current bankroll is the sizing base
+- basket trades are only used if they improve expected log growth over the best single
+
+## Forced Continuity Fallback
+
+If a market is inside `T-8` and no normal trade survives the gates, the bot still logs one trade for that market.
+
+Last-resort bracket selection:
+
+- choose the bracket with the highest `modelProb`
+- require executable `marketPrice > 0`
+- break ties by higher edge, then lower price
+
+Forced sizing:
+
+- use the normal `suggestedUsd` if positive
+- otherwise use `$1`
+- always cap by available forward-test bankroll
+
+This path intentionally ignores the normal Kelly / EV / minimum-size gates and exists to avoid forward-test interruptions.
+
+## Snapshot Fallback
+
+If live ensemble fetches fail, the forward-test logger can fall back to `data/weather_snapshot_latest.json`.
+
+Fallback order:
+
+1. use the best normal `BUY` from the latest fresh snapshot if one exists
+2. otherwise use the same forced highest-model-probability rule, but only once the market has reached `T-8`
+
+Snapshot-driven trades are marked in the CSV audit notes.
+
+## Bankroll Model
+
+Forward-test bankroll is derived from `data/forward_test_log.csv`.
+
+Formula:
+
+- start at `$1000`
+- add realized `pnl` from resolved trades
+- subtract `suggested_usd` from unresolved trades as open risk
+
+Only one unresolved trade may exist per `city + market_date`.
+
+## Portal And Data Artifacts
+
+Main generated artifacts:
+
+- `data/weather_analysis.html`
+  multi-city portal with model vs market, EV/Kelly table, trade eligibility, and audit log
+- `data/weather_snapshot_latest.json`
+  latest model/market snapshot cache
+- `data/weather_snapshot_history.jsonl`
+  append-only snapshot history
+- `data/forward_test_log.csv`
+  forward-test trade log, bankroll source, and audit trail
+
+The portal currently defaults to a lighter `2`-day forecast view to reduce upstream load and rate-limit pressure.
+
+## Automation Loop
+
+The `weather-updater` container runs a recurring cycle:
+
+1. `weather:snapshot --days 2`
+2. `weather:fwdtest all --city all`
+3. `weather:viz --city all --days 2`
+4. `weather:health`
+
+The cycle currently sleeps for `30` minutes between runs.
 
 ## Setup
 
 1. Copy `.env.example` to `.env`.
-2. Fill in:
-   - `USER_ADDRESSES`
-   - `PRIVATE_KEY`
-   - `FUNDER_ADDRESS`
-3. Keep `PREVIEW_MODE=true` for the first run.
-4. If you want to follow multiple traders, set `USER_ADDRESSES` as a comma-separated list.
-5. If you want to copy only selected events, set `ALLOWED_EVENT_KEYWORDS` to comma-separated keywords such as `temperature`.
-4. Build the image:
+2. Fill in the required wallet and Polymarket configuration.
+3. Keep `PREVIEW_MODE=true` for dry runs unless you explicitly want live orders.
+4. Build the containers:
 
 ```bash
 docker compose build
 ```
 
-## Verification checklist
-
-Run the connectivity and wallet validation check:
-
-```bash
-docker compose run --rm bot npm run check
-```
-
-Then start the bot in preview:
-
-```bash
-docker compose up
-```
-
-Review logs and confirm:
-
-- the followed wallet returns real trade activity
-- each fresh trade appears once
-- repeated polls do not re-log already-seen activity
-- skipped trades include a clear `reason`
-- preview orders include `slug`, `tokenId`, `conditionId`, `price`, `orderUsd`, and `orderSize`
-
-## Live rollout checklist
-
-Before changing `PREVIEW_MODE=false`:
-
-- keep `BUY_ONLY=true`
-- keep `COPY_RATIO` small
-- keep `MAX_ORDER_USD` low for first live orders
-- validate the wallet config with `npm run check`
-- start with one followed wallet only
-
-For the first live rollout:
-
-1. Set `PREVIEW_MODE=false`.
-2. Restart the bot.
-3. Watch logs for `live_order_submission` and `Live order submitted`.
-4. Confirm the response payload is present.
-5. If behavior is not what you expect, stop the bot and switch back to preview mode.
-
-## State and rollback
-
-- State is stored at `STATE_PATH` and contains processed activity ids.
-- Preserve the state file when restarting normally so old activity is not replayed.
-- Remove the state file only when you intentionally want to replay historical activity for testing.
-- If the bot misbehaves in live mode, stop the container and set `PREVIEW_MODE=true` before restarting.
-
-## Development
+## Common Commands
 
 Run tests:
 
 ```bash
-docker compose run --rm bot npm test
+npm test
 ```
 
-## Notes
+Build TypeScript:
 
-- Official docs used for this build:
-  - Quickstart: https://docs.polymarket.com/quickstart
-  - API overview: https://docs.polymarket.com/api-reference/introduction
-  - Market data overview: https://docs.polymarket.com/market-data/overview
+```bash
+npm run build
+```
 
-## Filtering examples
+Generate latest snapshot cache:
 
-- Follow multiple wallets:
-  - `USER_ADDRESSES=0xabc...,0xdef...,0x123...`
-- Only copy events whose title or slug contains "temperature":
-  - `ALLOWED_EVENT_KEYWORDS=temperature`
-- Only copy events matching either of several keywords:
-  - `ALLOWED_EVENT_KEYWORDS=temperature,climate,weather`
-- Leave `ALLOWED_EVENT_KEYWORDS` blank to disable keyword filtering:
-  - `ALLOWED_EVENT_KEYWORDS=`
+```bash
+npm run weather:snapshot -- --days 2
+```
+
+Run forward test manually:
+
+```bash
+npm run weather:fwdtest -- all --city all
+```
+
+Rebuild the portal:
+
+```bash
+npm run weather:viz -- --city all --days 2
+```
+
+Start the full stack:
+
+```bash
+docker compose up -d
+```
+
+## Verification Checklist
+
+When validating a strategy or deployment, confirm:
+
+- snapshot files refresh successfully
+- the portal rebuilds without stale dates
+- forward-test log rows include the expected notes and order status
+- market cards show the correct eligibility state for the current time window
+- duplicate protection prevents more than one unresolved trade per `city + market_date`
+- bankroll changes match resolved P&L and open risk
+
+## Important Strategy References
+
+- [FORWARD_TEST_LOGIC.md](FORWARD_TEST_LOGIC.md)
+- [src/weather/forwardtest.ts](/docker/polymarket/src/weather/forwardtest.ts:1)
+- [src/weather/visualize.ts](/docker/polymarket/src/weather/visualize.ts:1)
+- [src/weather/snapshot.ts](/docker/polymarket/src/weather/snapshot.ts:1)
+- [src/weather/ev.ts](/docker/polymarket/src/weather/ev.ts:1)

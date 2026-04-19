@@ -26,7 +26,11 @@ import {
 } from './postprocess';
 import { buildCurrentForecastFeatureRows } from './train_postprocess';
 import { applyLiveMetarTemperatureFloor, applyTafRiskToSignals, fetchStationNowcast, fetchTafRiskOverlay } from './aviation';
-import { tradeWindowOpenUtcMs, cityDayEndUtcMs } from './time';
+import { cityDayEndUtcMs } from './time';
+import {
+  forcedFallbackWindowOpenUtcMs,
+  normalTradeWindowOpenUtcMs,
+} from './forward_policy';
 
 type SnapshotLeg = {
   bracket: string;
@@ -44,8 +48,10 @@ type SnapshotLeg = {
 type SnapshotDay = {
   date: string;
   tradeWindowOpenUtc: string;
+  forcedFallbackWindowOpenUtc: string;
   tradeWindowCloseUtc: string;
   inTradeWindow: boolean;
+  inForcedFallbackWindow: boolean;
   volume: number;
   liquidity: number;
   modelSource: 'postprocessed' | 'ensemble';
@@ -96,12 +102,22 @@ type SnapshotRun = {
 
 const args = process.argv.slice(2);
 const daysIdx = args.indexOf('--days');
-const forecastDays = daysIdx !== -1 ? parseInt(args[daysIdx + 1] ?? '3', 10) : 3;
+const forecastDays = daysIdx !== -1 ? parseInt(args[daysIdx + 1] ?? '2', 10) : 2;
 const HISTORY_PATH = 'data/weather_snapshot_history.jsonl';
 const LATEST_PATH = 'data/weather_snapshot_latest.json';
 const CITY_SNAPSHOT_DIR = 'data/weather_snapshot_latest_cities';
-const TRADE_WINDOW_HOURS = 8;
 const BANKROLL_USD = 1000;
+const CITY_REQUEST_STAGGER_MS = 3000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function rotateCityIds(cityIds: readonly string[], offset: number): string[] {
+  if (!cityIds.length) return [];
+  const normalized = ((offset % cityIds.length) + cityIds.length) % cityIds.length;
+  return [...cityIds.slice(normalized), ...cityIds.slice(0, normalized)];
+}
 
 async function snapshotCity(city: CityConfig): Promise<SnapshotCity> {
   const ecmwfMembers = await fetchEcmwfEnsemble(city, forecastDays);
@@ -164,14 +180,17 @@ async function snapshotCity(city: CityConfig): Promise<SnapshotCity> {
           ? 'single'
           : 'none';
 
-    const windowOpenMs = tradeWindowOpenUtcMs(date, city.timezone, TRADE_WINDOW_HOURS);
+    const windowOpenMs = normalTradeWindowOpenUtcMs(date, city.timezone);
+    const forcedWindowOpenMs = forcedFallbackWindowOpenUtcMs(date, city.timezone);
     const windowCloseMs = cityDayEndUtcMs(date, city.timezone);
 
     days.push({
       date,
       tradeWindowOpenUtc: new Date(windowOpenMs).toISOString(),
+      forcedFallbackWindowOpenUtc: new Date(forcedWindowOpenMs).toISOString(),
       tradeWindowCloseUtc: new Date(windowCloseMs).toISOString(),
       inTradeWindow: Date.now() >= windowOpenMs && Date.now() < windowCloseMs,
+      inForcedFallbackWindow: Date.now() >= forcedWindowOpenMs && Date.now() < windowCloseMs,
       volume: odds?.volume ?? 0,
       liquidity: odds?.liquidity ?? 0,
       modelSource: useProbabilistic ? 'postprocessed' : 'ensemble',
@@ -231,9 +250,11 @@ function mean(values: number[]): number {
 async function main(): Promise<void> {
   const refreshedCities: SnapshotCity[] = [];
   const skippedCityIds: string[] = [];
-  for (const cityId of FORWARD_TEST_CITY_IDS) {
+  const rotatedCityIds = rotateCityIds(FORWARD_TEST_CITY_IDS, Math.floor(Date.now() / 1_800_000));
+  for (const [index, cityId] of rotatedCityIds.entries()) {
     const city = CITIES[cityId];
     if (!city) continue;
+    if (index > 0) await sleep(CITY_REQUEST_STAGGER_MS);
     process.stdout.write(`  [${city.name}] snapshot… `);
     try {
       const snapshot = await snapshotCity(city);
@@ -289,6 +310,7 @@ async function main(): Promise<void> {
 function loadMergedLatestCities(): SnapshotCity[] {
   const ids = new Set<string>(FORWARD_TEST_CITY_IDS);
   const loaded = new Map<string, SnapshotCity>();
+  const cityOrder = new Map(FORWARD_TEST_CITY_IDS.map((cityId, index) => [cityId, index]));
 
   for (const cityId of ids) {
     const path = citySnapshotPath(cityId);
@@ -314,7 +336,10 @@ function loadMergedLatestCities(): SnapshotCity[] {
     }
   }
 
-  return [...loaded.values()].sort((a, b) => FORWARD_TEST_CITY_IDS.indexOf(a.cityId) - FORWARD_TEST_CITY_IDS.indexOf(b.cityId));
+  return [...loaded.values()].sort((a, b) =>
+    (cityOrder.get(a.cityId as (typeof FORWARD_TEST_CITY_IDS)[number]) ?? Number.MAX_SAFE_INTEGER) -
+    (cityOrder.get(b.cityId as (typeof FORWARD_TEST_CITY_IDS)[number]) ?? Number.MAX_SAFE_INTEGER)
+  );
 }
 
 function citySnapshotPath(cityId: string): string {

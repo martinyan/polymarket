@@ -23,25 +23,32 @@
 
 import { BracketProbabilities, Bracket, buildBrackets, bracketLabel } from './brackets';
 import { CityConfig } from './cities';
+import { BRIER_SKIP_THRESHOLD } from './calibration';
 
 // Conservative defaults — override per session risk tolerance
-export const KELLY_SCALE       = 0.25;  // quarter-Kelly reduces variance
-export const MIN_KELLY         = 0.03;  // skip bets with < 3% Kelly fraction
-export const MIN_EV_PER_DOLLAR = 0.04;  // skip bets with < 4¢ EV per dollar
-export const MAX_POSITION_USD  = 100;   // hard cap per bracket per day
-export const MIN_POSITION_USD  = 5;     // Polymarket minimum order size
-export const MIN_MARKET_PRICE  = 0.05;  // skip brackets priced below 5¢ — stale/illiquid
+export const KELLY_SCALE            = 0.25;  // quarter-Kelly reduces variance
+export const KELLY_SCALE_HIGH_SPREAD = 0.10; // reduced scale when ensemble is uncertain
+export const MIN_KELLY              = 0.03;  // skip bets with < 3% Kelly fraction
+export const MIN_EV_PER_DOLLAR      = 0.04;  // skip bets with < 4¢ EV per dollar
+export const MAX_POSITION_USD       = 100;   // hard cap per bracket per day
+export const MIN_POSITION_USD       = 5;     // Polymarket minimum order size
+export const MIN_MARKET_PRICE       = 0.05;  // skip brackets priced below 5¢ — stale/illiquid
+export const MAX_YES_PRICE_FOR_NO   = 0.95;  // skip NO when YES price ≥ 95¢ (NO price ≤ 5¢ — illiquid)
+export const SPREAD_GATE_SKIP_C     = 6;     // skip entirely when ensemble spread exceeds this
+export const SPREAD_GATE_REDUCE_C   = 4;     // reduce Kelly scale when spread exceeds this
 
 export type BetSignal = {
   bracket: Bracket;
   label: string;
-  modelProb: number;      // Q
-  marketPrice: number;    // P  (same as implied prob for binary)
-  edge: number;           // Q - P
-  evPerDollar: number;    // Q/P - 1
-  kellyFraction: number;  // (Q-P)/(1-P)
-  scaledKelly: number;    // kellyFraction * KELLY_SCALE
-  suggestedUsd: number;   // bankroll * scaledKelly, capped
+  tradeDirection: 'YES' | 'NO'; // which token to buy
+  modelProb: number;       // Q  — model prob that this bracket resolves YES
+  marketPrice: number;     // P  — YES token price on Polymarket
+  edge: number;            // Q - P for YES; P - Q for NO (always positive when BUY)
+  evPerDollar: number;     // Q/P - 1 for YES; (1-Q)/(1-P) - 1 for NO
+  kellyFraction: number;   // (Q-P)/(1-P) for YES; (P-Q)/P for NO
+  scaledKelly: number;     // kellyFraction * effective kelly scale (spread-adjusted)
+  suggestedUsd: number;    // bankroll * scaledKelly, capped
+  ensembleSpreadC: number; // stddev of ensemble member temps (0 = not provided)
   action: 'BUY' | 'SKIP';
   reason?: string;
 };
@@ -83,66 +90,116 @@ export function computeBetSignals(
   marketProbs: Partial<BracketProbabilities>,
   city: CityConfig,
   bankrollUsd = 1000,
+  ensembleSpreadC = 0,
+  kellyScaleMultiplier = 1,
 ): BetSignal[] {
   const brackets = buildBrackets(city);
   const signals: BetSignal[] = [];
+  const baseKellyScale = KELLY_SCALE * Math.max(0, kellyScaleMultiplier);
+  const effectiveKellyScale =
+    baseKellyScale <= 0                     ? 0 :
+    ensembleSpreadC >= SPREAD_GATE_SKIP_C   ? 0 :
+    ensembleSpreadC >= SPREAD_GATE_REDUCE_C ? Math.min(KELLY_SCALE_HIGH_SPREAD, baseKellyScale) :
+    baseKellyScale;
 
   for (const bracket of brackets) {
     const Q = modelProbs[bracket] ?? 0;
     const P = marketProbs[bracket] ?? 0;
 
     if (P <= 0 || P >= 1) {
-      // No liquid market or already resolved
       signals.push({
-        bracket, label: bracketLabel(bracket, city),
+        bracket, label: bracketLabel(bracket, city), tradeDirection: 'YES',
         modelProb: Q, marketPrice: P,
         edge: Q - P, evPerDollar: 0, kellyFraction: 0,
-        scaledKelly: 0, suggestedUsd: 0,
+        scaledKelly: 0, suggestedUsd: 0, ensembleSpreadC,
         action: 'SKIP', reason: P <= 0 ? 'no market price' : 'price at ceiling',
       });
       continue;
     }
 
     if (P < MIN_MARKET_PRICE) {
-      // Price below liquidity floor — edge is noise from stale/untraded sub-market
       signals.push({
-        bracket, label: bracketLabel(bracket, city),
+        bracket, label: bracketLabel(bracket, city), tradeDirection: 'YES',
         modelProb: Q, marketPrice: P,
         edge: Q - P, evPerDollar: Q / P - 1, kellyFraction: 0,
-        scaledKelly: 0, suggestedUsd: 0,
+        scaledKelly: 0, suggestedUsd: 0, ensembleSpreadC,
         action: 'SKIP', reason: `price ${(P*100).toFixed(1)}¢ < min ${(MIN_MARKET_PRICE*100).toFixed(0)}¢ liquidity floor`,
       });
       continue;
     }
 
-    const edge          = Q - P;
-    const evPerDollar   = Q / P - 1;                          // profit per $1 if model is right
-    const kellyFraction = edge > 0 ? edge / (1 - P) : 0;     // Kelly formula for binary bets
-    const scaledKelly   = kellyFraction * KELLY_SCALE;
-    const rawUsd        = bankrollUsd * scaledKelly;
-    const suggestedUsd  = Math.min(Math.max(rawUsd, 0), MAX_POSITION_USD);
+    // ── YES signal ──────────────────────────────────────────────────────────
+    {
+      const edge          = Q - P;
+      const evPerDollar   = Q / P - 1;
+      const kellyFraction = edge > 0 ? edge / (1 - P) : 0;
+      const scaledKelly   = kellyFraction * effectiveKellyScale;
+      const suggestedUsd  = Math.min(Math.max(bankrollUsd * scaledKelly, 0), MAX_POSITION_USD);
 
-    let action: 'BUY' | 'SKIP' = 'SKIP';
-    let reason: string | undefined;
+      let action: 'BUY' | 'SKIP' = 'SKIP';
+      let reason: string | undefined;
 
-    if (edge <= 0) {
-      reason = `model prob (${(Q*100).toFixed(1)}%) ≤ market price (${(P*100).toFixed(1)}%)`;
-    } else if (kellyFraction < MIN_KELLY) {
-      reason = `Kelly ${(kellyFraction*100).toFixed(1)}% < min ${(MIN_KELLY*100).toFixed(0)}%`;
-    } else if (evPerDollar < MIN_EV_PER_DOLLAR) {
-      reason = `EV ${(evPerDollar*100).toFixed(1)}¢/$ < min ${(MIN_EV_PER_DOLLAR*100).toFixed(0)}¢`;
-    } else if (suggestedUsd < MIN_POSITION_USD) {
-      reason = `size $${suggestedUsd.toFixed(2)} < min $${MIN_POSITION_USD}`;
-    } else {
-      action = 'BUY';
+      if (kellyScaleMultiplier <= 0) {
+        reason = `calibration skip: Brier score exceeds ${BRIER_SKIP_THRESHOLD} threshold`;
+      } else if (ensembleSpreadC >= SPREAD_GATE_SKIP_C) {
+        reason = `spread ${ensembleSpreadC.toFixed(1)}°C ≥ ${SPREAD_GATE_SKIP_C}°C skip threshold`;
+      } else if (edge <= 0) {
+        reason = `model prob (${(Q*100).toFixed(1)}%) ≤ market price (${(P*100).toFixed(1)}%)`;
+      } else if (kellyFraction < MIN_KELLY) {
+        reason = `Kelly ${(kellyFraction*100).toFixed(1)}% < min ${(MIN_KELLY*100).toFixed(0)}%`;
+      } else if (evPerDollar < MIN_EV_PER_DOLLAR) {
+        reason = `EV ${(evPerDollar*100).toFixed(1)}¢/$ < min ${(MIN_EV_PER_DOLLAR*100).toFixed(0)}¢`;
+      } else if (suggestedUsd < MIN_POSITION_USD) {
+        reason = `size $${suggestedUsd.toFixed(2)} < min $${MIN_POSITION_USD}`;
+      } else {
+        action = 'BUY';
+      }
+
+      signals.push({
+        bracket, label: bracketLabel(bracket, city), tradeDirection: 'YES',
+        modelProb: Q, marketPrice: P,
+        edge, evPerDollar, kellyFraction, scaledKelly, suggestedUsd, ensembleSpreadC,
+        action, reason,
+      });
     }
 
-    signals.push({
-      bracket, label: bracketLabel(bracket, city),
-      modelProb: Q, marketPrice: P,
-      edge, evPerDollar, kellyFraction, scaledKelly, suggestedUsd,
-      action, reason,
-    });
+    // ── NO signal — bracket is overpriced; buy NO token ────────────────────
+    // NO Kelly = (P-Q)/P;  NO EV = (1-Q)/(1-P) - 1
+    // Only compute when YES price is below the liquidity ceiling (NO price ≥ MIN_MARKET_PRICE)
+    if (P <= MAX_YES_PRICE_FOR_NO) {
+      const noEdge          = P - Q;                         // positive when market overprices
+      const noEvPerDollar   = (1 - Q) / (1 - P) - 1;
+      const noKellyFraction = noEdge > 0 ? noEdge / P : 0;
+      const noScaledKelly   = noKellyFraction * effectiveKellyScale;
+      const noSuggestedUsd  = Math.min(Math.max(bankrollUsd * noScaledKelly, 0), MAX_POSITION_USD);
+
+      let noAction: 'BUY' | 'SKIP' = 'SKIP';
+      let noReason: string | undefined;
+
+      if (kellyScaleMultiplier <= 0) {
+        noReason = `calibration skip: Brier score exceeds ${BRIER_SKIP_THRESHOLD} threshold`;
+      } else if (ensembleSpreadC >= SPREAD_GATE_SKIP_C) {
+        noReason = `spread ${ensembleSpreadC.toFixed(1)}°C ≥ ${SPREAD_GATE_SKIP_C}°C skip threshold`;
+      } else if (noEdge <= 0) {
+        noReason = `market price (${(P*100).toFixed(1)}%) ≤ model prob (${(Q*100).toFixed(1)}%) — no NO edge`;
+      } else if (noKellyFraction < MIN_KELLY) {
+        noReason = `NO Kelly ${(noKellyFraction*100).toFixed(1)}% < min ${(MIN_KELLY*100).toFixed(0)}%`;
+      } else if (noEvPerDollar < MIN_EV_PER_DOLLAR) {
+        noReason = `NO EV ${(noEvPerDollar*100).toFixed(1)}¢/$ < min ${(MIN_EV_PER_DOLLAR*100).toFixed(0)}¢`;
+      } else if (noSuggestedUsd < MIN_POSITION_USD) {
+        noReason = `NO size $${noSuggestedUsd.toFixed(2)} < min $${MIN_POSITION_USD}`;
+      } else {
+        noAction = 'BUY';
+      }
+
+      signals.push({
+        bracket, label: `${bracketLabel(bracket, city)} NO`, tradeDirection: 'NO',
+        modelProb: Q, marketPrice: P,
+        edge: noEdge, evPerDollar: noEvPerDollar, kellyFraction: noKellyFraction,
+        scaledKelly: noScaledKelly, suggestedUsd: noSuggestedUsd, ensembleSpreadC,
+        action: noAction, reason: noReason,
+      });
+    }
   }
 
   // Sort: BUY signals first by EV, then SKIP by edge descending
